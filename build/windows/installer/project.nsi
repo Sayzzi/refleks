@@ -32,7 +32,9 @@ Unicode true
 ####
 ## Include the wails tools
 ####
+!define PRODUCT_EXECUTABLE "refleks.exe"
 !include "wails_tools.nsh"
+!include "LogicLib.nsh"
 
 # The version information for this two must consist of 4 parts
 VIProductVersion "${INFO_PRODUCTVERSION}.0"
@@ -79,6 +81,19 @@ ShowInstDetails show # This will always show the installation details.
 
 Function .onInit
    !insertmacro wails.checkArchitecture
+
+   ; In-app updates from older releases do not pass an install directory to
+   ; this installer. Recover it from the existing uninstall metadata so an
+   ; upgrade from 0.8.3 (whose updater has no knowledge of the new path
+   ; handoff) still replaces the installation that launched the update.
+   SetRegView 64
+   ReadRegStr $0 HKLM "${UNINST_KEY}" "DisplayIcon"
+   ${If} $0 != ""
+       ${GetParent} "$0" $1
+       ${If} $1 != ""
+           StrCpy $INSTDIR $1
+       ${EndIf}
+   ${EndIf}
 FunctionEnd
 
 Section
@@ -86,11 +101,52 @@ Section
 
     !insertmacro wails.webview2runtime
 
+    ; Stop either executable name before replacing the application. Do not
+    ; use taskkill's /T flag: when the installer is launched by the old app,
+    ; it can be in that app's process tree, and /T would kill the installer
+    ; along with the monitor process. Manual launches from Explorer do not
+    ; have that process-tree relationship, which explains the different
+    ; behavior between manual and automatic updates.
+    ;
+    ; Do not recursively remove $INSTDIR here. The in-app updater launches this
+    ; installer while the old process is still shutting down, and deleting the
+    ; live install directory can fail or make NSIS abort during the file page.
+    ClearErrors
+    nsExec::Exec `taskkill /F /IM "refleks.exe"`
+    ClearErrors
+    nsExec::Exec `taskkill /F /IM "RefleK's.exe"`
+    Sleep 1000
+
+    ; Remove the old executable name left by 0.8.3. The current executable is
+    ; replaced by wails.files below; the remaining application files are
+    ; intentionally preserved so an update does not depend on deleting a live
+    ; directory.
+    Delete "$INSTDIR\RefleK's.exe"
+    Delete "$INSTDIR\uninstall.exe"
+
     SetOutPath $INSTDIR
 
     !insertmacro wails.files
 
-    CreateShortcut "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
+    ; Keep the autostart registration working across updates. The app was
+    ; renamed from "RefleK's.exe" to "refleks.exe", and a stale entry can point
+    ; at a binary that no longer exists (or at an old install directory), which
+    ; would silently fail at login. Preserve the user's choice by re-registering
+    ; the new executable under a single canonical value name.
+    ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "refleks"
+    ReadRegStr $1 HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RefleK's"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "refleks"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RefleK's"
+    ${If} $0 != ""
+        WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "refleks" '"$INSTDIR\${PRODUCT_EXECUTABLE}" --monitor'
+    ${ElseIf} $1 != ""
+        WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "refleks" '"$INSTDIR\${PRODUCT_EXECUTABLE}" --monitor'
+    ${EndIf}
+
+  	; FFmpeg for screen recording
+  	File "..\..\bin\ffmpeg.exe"
+
+  	CreateShortcut "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
     CreateShortCut "$DESKTOP\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
 
     !insertmacro wails.associateFiles
@@ -103,8 +159,13 @@ Section "uninstall"
     !insertmacro wails.setShellContext
 
     RMDir /r "$AppData\${PRODUCT_EXECUTABLE}" # Remove the WebView2 DataPath
+    RMDir /r "$AppData\RefleK's.exe"          # Legacy WebView2 DataPath (pre-rename)
 
     RMDir /r $INSTDIR
+
+    ; Remove the autostart entry so the app is not launched after uninstall.
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "refleks"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RefleK's"
 
     Delete "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk"
     Delete "$DESKTOP\${INFO_PRODUCTNAME}.lnk"

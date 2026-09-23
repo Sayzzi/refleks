@@ -26,6 +26,10 @@ type Updater struct {
 	client  *http.Client
 }
 
+// ErrUnsupportedOS is returned when an update operation runs on a platform
+// that the installer does not support.
+var ErrUnsupportedOS = errors.New("auto-update currently supported on Windows only")
+
 // New constructs a new Updater.
 func New(owner, repo, current string) *Updater {
 	return &Updater{
@@ -33,6 +37,39 @@ func New(owner, repo, current string) *Updater {
 		Repo:    repo,
 		Current: sanitizeVer(current),
 		client:  &http.Client{Timeout: time.Duration(constants.UpdaterHTTPTimeoutSeconds) * time.Second},
+	}
+}
+
+// CleanupAbandonedDownloads removes updater directories left in the OS temp
+// directory after an interrupted or failed update. A successful download must
+// survive the current process because the detached installer uses it after
+// RefleK exits; stale directories are therefore cleaned on the next startup.
+func CleanupAbandonedDownloads() error {
+	return cleanupAbandonedDownloads(os.TempDir())
+}
+
+func cleanupAbandonedDownloads(tempDir string) error {
+	entries, err := os.ReadDir(tempDir)
+	if err != nil {
+		return err
+	}
+
+	var errs []error
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), constants.UpdaterTempDirPrefix) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(tempDir, entry.Name())); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func cleanupDownloadedInstaller(path string) {
+	dir := filepath.Dir(path)
+	if strings.HasPrefix(filepath.Base(dir), constants.UpdaterTempDirPrefix) {
+		_ = os.RemoveAll(dir)
 	}
 }
 
@@ -119,12 +156,11 @@ func (u *Updater) Latest(ctx context.Context) (string, string, error) {
 
 // BuildDownloadURL builds the expected installer URL for a given version and current OS.
 func (u *Updater) BuildDownloadURL(version string) (string, error) {
-	version = sanitizeVer(version)
 	if version == "" {
 		return "", errors.New("empty version")
 	}
 	if runtime.GOOS != "windows" {
-		return "", errors.New("auto-update currently supported on Windows only")
+		return "", ErrUnsupportedOS
 	}
 	asset := fmt.Sprintf(constants.WindowsInstallerNameFmt, version)
 	url := fmt.Sprintf(constants.GitHubDownloadURLFmt, u.Owner, u.Repo, version, asset)
@@ -152,21 +188,32 @@ func (u *Updater) Download(ctx context.Context, version string) (string, error) 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("download status %d", resp.StatusCode)
 	}
-	tmpDir, err := os.MkdirTemp("", "refleks-update-")
+	tmpDir, err := os.MkdirTemp("", constants.UpdaterTempDirPrefix)
 	if err != nil {
 		return "", err
 	}
+	keepTempDir := false
+	defer func() {
+		if !keepTempDir {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}()
+
 	fileName := fmt.Sprintf(constants.WindowsInstallerNameFmt, version)
 	path := filepath.Join(tmpDir, fileName)
 	f, err := os.Create(path)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
 	if _, err := io.Copy(f, resp.Body); err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
 		return "", err
 	}
 	_ = os.Chmod(path, 0o755)
+	keepTempDir = true
 	return path, nil
 }
 
@@ -176,7 +223,11 @@ func (u *Updater) LaunchInstaller(ctx context.Context, path string) error {
 	// Intentionally ignore ctx for the child process to avoid cancellation
 	// when the app quits. The installer must continue independently.
 	if runtime.GOOS != "windows" {
-		return errors.New("auto-update currently supported on Windows only")
+		return ErrUnsupportedOS
 	}
-	return launchInstallerDetached(path)
+	if err := launchInstallerDetached(path); err != nil {
+		cleanupDownloadedInstaller(path)
+		return err
+	}
+	return nil
 }

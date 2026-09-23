@@ -3,10 +3,17 @@ package constants
 const (
 	// Settings + paths
 	// Name of the app config folder in the user's home directory
-	ConfigDirName  = ".refleks"
-	RunsSubdirName = "runs"
-	RunFileExt     = ".refleks"
-	StatsFileExt   = ".csv"
+	ConfigDirName      = ".refleks"
+	RunsSubdirName     = "runs"
+	RunFileExt         = ".refleks"
+	ReplaysSubdirName  = "replays"
+	StatsFileExt       = ".csv"
+	PerformanceFileExt = ".perf"
+
+	// Prefixes for temporary directories that may survive an interrupted
+	// process and are safe to remove during the next startup.
+	ScreenCaptureTempDirPrefix = "refleks-capture-"
+	UpdaterTempDirPrefix       = "refleks-update-"
 
 	KovaaksDataDirName         = "FPSAimTrainer"
 	KovaaksStatsDirName        = "stats"
@@ -19,6 +26,8 @@ const (
 	DefaultWindowsSteamInstallDir = `C:\\Program Files (x86)\\Steam`
 
 	// Environment variable names
+	// If set, this overrides the default Steam install directory (useful in dev containers)
+	EnvSteamInstallDirVar = "REFLEKS_STEAM_INSTALL_DIR"
 	// If set, this overrides SteamID detection from loginusers.vdf
 	EnvSteamIDVar = "REFLEKS_STEAM_ID"
 	// If set, this overrides PersonaName detection from loginusers.vdf
@@ -38,4 +47,7 @@ const (
 	BenchmarksDataCacheFileName    = "benchmarks.json"
 	BenchmarkProgressCacheFileName = "benchmark_progress.json"
 	SettingsFileName               = "settings.json"
+
+	// User-editable custom theme stylesheet in the config directory.
+	CustomThemeFileName = "custom.css"
 )

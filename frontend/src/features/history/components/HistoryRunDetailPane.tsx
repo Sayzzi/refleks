@@ -1,29 +1,37 @@
-import { Button, SegmentedControl } from '@/shared/components'
-import { usePersistedState } from '@/shared/hooks'
-import { cn, getSettings, STORAGE_KEYS } from '@/shared/lib'
-import { Columns2, Layers, PanelRightClose, Rows2, Trophy } from 'lucide-react'
-import { useEffect, useState } from 'react'
-import type { HistoryRun } from '../lib/historyModels'
-import { INSPECTOR_TABS, type InspectorTab } from '../lib/inspectorTabs'
-import { AnalysisTab } from './inspector/AnalysisTab'
-import { EnvironmentTab } from './inspector/EnvironmentTab'
-import { StatsTab } from './inspector/StatsTab'
-import { TraceTab } from './inspector/TraceTab'
+import { Button, SegmentedControl } from "@/shared/components";
+import { usePersistedState } from "@/shared/hooks";
+import { getSettings, STORAGE_KEYS, useI18n } from "@/shared/lib";
+import {
+  Columns2,
+  Layers,
+  PanelRightClose,
+  PinOff,
+  Rows2,
+  Trophy,
+} from "lucide-react";
+import { useEffect, useState } from "react";
+import type { HistoryRun } from "../lib/historyModels";
+import { INSPECTOR_TABS, type InspectorTab } from "../lib/inspectorTabs";
+import { AnalysisTab } from "./inspector/AnalysisTab";
+import { EnvironmentTab } from "./inspector/EnvironmentTab";
+import { ReplayTab } from "./inspector/ReplayTab";
+import { StatsTab } from "./inspector/StatsTab";
+import { TraceTab } from "./inspector/TraceTab";
 
-export type { InspectorTab }
+export type { InspectorTab };
 
 type Props = {
-  primaryRun: HistoryRun | null
-  compareRun: HistoryRun | null
-  activeTab: InspectorTab
-  onTabChange: (tab: InspectorTab) => void
-  onClose: () => void
-  onClearPrimaryRun: () => void
-  onClearComparison: () => void
-  isPrimaryPb: boolean
-  isComparePb: boolean
-  onComparePb: () => void
-}
+  primaryRun: HistoryRun | null;
+  compareRun: HistoryRun | null;
+  activeTab: InspectorTab;
+  onTabChange: (tab: InspectorTab) => void;
+  onClose: () => void;
+  onClearPrimaryRun: () => void;
+  onClearComparison: () => void;
+  isPrimaryPb: boolean;
+  isComparePb: boolean;
+  onComparePb: () => void;
+};
 
 export function HistoryRunDetailPane({
   primaryRun,
@@ -37,33 +45,40 @@ export function HistoryRunDetailPane({
   isComparePb,
   onComparePb,
 }: Props) {
-  const [overlay, setOverlay] = usePersistedState(STORAGE_KEYS.historyAnalysisOverlay, false)
-  const [anonymousEnabled, setAnonymousEnabled] = useState(false)
+  const { t } = useI18n();
+  const [overlay, setOverlay] = usePersistedState(
+    STORAGE_KEYS.historyAnalysisOverlay,
+    false,
+  );
+  const [anonymousEnabled, setAnonymousEnabled] = useState(false);
 
   useEffect(() => {
-    let active = true
+    let active = true;
 
     getSettings()
-      .then(settings => {
-        if (!active) return
-        setAnonymousEnabled(settings.anonymousEnabled === true)
+      .then((settings) => {
+        if (!active) return;
+        setAnonymousEnabled(settings.anonymousEnabled === true);
       })
       .catch(() => {
-        if (!active) return
-        setAnonymousEnabled(false)
-      })
+        if (!active) return;
+        setAnonymousEnabled(false);
+      });
 
     return () => {
-      active = false
-    }
-  }, [])
+      active = false;
+    };
+  }, []);
 
   return (
     <section className="flex h-full min-h-0 flex-col overflow-hidden rounded-xl bg-surface">
       <div className="flex items-center justify-between gap-2 px-4 py-3">
         <SegmentedControl
           value={activeTab}
-          options={INSPECTOR_TABS}
+          options={INSPECTOR_TABS.map((tab) => ({
+            value: tab.value,
+            label: t(tab.labelKey),
+          }))}
           onValueChange={onTabChange}
         />
         <div className="flex items-center gap-1">
@@ -72,32 +87,55 @@ export function HistoryRunDetailPane({
               variant="ghost"
               size="sm"
               onClick={onComparePb}
-              title="Compare with personal best"
+              title={t("history.inspector.compareWithPb")}
             >
               <Trophy className="mr-1 h-3.5 w-3.5" />
-              vs PB
+              {t("history.inspector.vsPb")}
             </Button>
           )}
-          {compareRun && (activeTab === 'analysis' || activeTab === 'trace') && (
-            <Button
-              variant={overlay ? 'secondary' : 'ghost'}
-              size="sm"
-              onClick={() => setOverlay(o => !o)}
-              title={overlay ? 'Show side by side' : 'Overlay both runs'}
-            >
-              {overlay
-                ? <><Columns2 className="mr-1 h-3.5 w-3.5" />Side by side</>
-                : <><Layers className="mr-1 h-3.5 w-3.5" />Overlay</>
-              }
-            </Button>
-          )}
+          {compareRun &&
+            (activeTab === "analysis" || activeTab === "trace") && (
+              <Button
+                variant={overlay ? "secondary" : "ghost"}
+                size="sm"
+                onClick={() => setOverlay((o) => !o)}
+                title={
+                  overlay
+                    ? t("history.inspector.showSideBySide")
+                    : t("history.inspector.overlayBoth")
+                }
+              >
+                {overlay ? (
+                  <>
+                    <Columns2 className="mr-1 h-3.5 w-3.5" />
+                    {t("history.inspector.sideBySide")}
+                  </>
+                ) : (
+                  <>
+                    <Layers className="mr-1 h-3.5 w-3.5" />
+                    {t("history.inspector.overlay")}
+                  </>
+                )}
+              </Button>
+            )}
           {compareRun && (
             <Button variant="ghost" size="sm" onClick={onClearComparison}>
               <Rows2 className="mr-1 h-3.5 w-3.5" />
-              Single
+              {t("history.inspector.single")}
             </Button>
           )}
-          <Button variant="ghost" size="icon" onClick={onClose} title="Close inspector">
+          {primaryRun && (
+            <Button variant="ghost" size="sm" onClick={onClearPrimaryRun}>
+              <PinOff className="mr-1 h-3.5 w-3.5" />
+              {t("history.inspector.clear")}
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onClose}
+            title={t("history.inspector.closeInspector")}
+          >
             <PanelRightClose className="h-4 w-4" />
           </Button>
         </div>
@@ -105,14 +143,13 @@ export function HistoryRunDetailPane({
 
       {!primaryRun ? (
         <div className="flex flex-1 items-center justify-center p-6">
-          <p className="text-sm text-surface-muted-foreground">Select a run to inspect</p>
+          <p className="text-sm text-surface-muted-foreground">
+            {t("history.inspector.selectRunToInspect")}
+          </p>
         </div>
       ) : (
-        <div className={cn(
-          'min-h-0 flex-1',
-          activeTab === 'trace' ? 'flex flex-col p-3 pt-1' : 'scrollbar-compact overflow-y-auto p-5 pt-2 space-y-4',
-        )}>
-          {activeTab === 'stats' && (
+        <div className="scrollbar-compact overflow-y-auto p-5 pt-2 space-y-4 min-h-0 flex-1">
+          {activeTab === "stats" && (
             <StatsTab
               primaryRun={primaryRun}
               compareRun={compareRun}
@@ -120,21 +157,24 @@ export function HistoryRunDetailPane({
               onClearComparison={onClearComparison}
             />
           )}
-          {activeTab === 'analysis' && (
+          {activeTab === "analysis" && (
             <AnalysisTab
               primaryRun={primaryRun}
               compareRun={compareRun}
               overlay={overlay}
             />
           )}
-          {activeTab === 'trace' && (
+          {activeTab === "trace" && (
             <TraceTab
               primaryRun={primaryRun}
               compareRun={compareRun}
               overlay={overlay}
             />
           )}
-          {activeTab === 'environment' && (
+          {activeTab === "replay" && (
+            <ReplayTab primaryRun={primaryRun} compareRun={compareRun} />
+          )}
+          {activeTab === "environment" && (
             <EnvironmentTab
               primaryRun={primaryRun}
               compareRun={compareRun}
@@ -146,5 +186,5 @@ export function HistoryRunDetailPane({
         </div>
       )}
     </section>
-  )
+  );
 }

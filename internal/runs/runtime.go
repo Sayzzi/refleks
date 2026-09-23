@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -13,21 +14,34 @@ import (
 	"refleks/internal/models"
 	"refleks/internal/process"
 	"refleks/internal/runs/mouse"
+	"refleks/internal/runs/screen"
 	appsettings "refleks/internal/settings"
 	"refleks/internal/watcher"
 )
 
-// RuntimeService coordinates watcher and mouse tracking around the run store.
+// RuntimeService coordinates watcher, mouse tracking, and screen capture around the run store.
 type RuntimeService struct {
 	ctx             context.Context
 	watcher         *watcher.Watcher
 	mouse           mouse.Provider
+	screen          screen.Provider
+	encoder         *screen.Encoder
 	runSyncClient   *CloudSyncClient
 	settingsSvc     *appsettings.Service
 	benchmarkSvc    *benchmarks.Service
 	runStore        *Store
 	procWatcher     *process.Watcher
 	procWatcherStop context.CancelFunc
+
+	// screenLifecycleMu serializes capture session boundaries. A settings
+	// update must finish stopping/finalizing the old session before starting a
+	// new one, otherwise pending trims can be associated with the wrong
+	// session directory.
+	screenLifecycleMu sync.Mutex
+
+	screenRecoveryMu       sync.Mutex
+	screenRecoveryWindow   time.Time
+	screenRecoveryAttempts int
 }
 
 // NewRuntimeService constructs the runtime orchestration service for runs.
@@ -44,8 +58,15 @@ func NewRuntimeService(ctx context.Context, settingsSvc *appsettings.Service, be
 
 	svc.mouse = mouse.New(constants.DefaultMouseSampleHz)
 	svc.mouse.SetBufferDuration(time.Duration(settings.MouseBufferMinutes) * time.Minute)
-	if settings.MouseTrackingEnabled {
-		svc.startMouseProcessWatcher()
+
+	svc.screen = screen.New(ctx)
+	svc.screen.SetFailureHandler(svc.handleScreenCaptureFailure)
+	svc.encoder = screen.NewEncoder()
+	svc.runStore.SetScreenCapture(ctx, svc.screen, svc.encoder)
+
+	if settings.MouseTrackingEnabled || settings.ScreenCaptureEnabled {
+		runtime.LogInfof(ctx, "runs: starting process watcher (mouse=%v screen=%v)", settings.MouseTrackingEnabled, settings.ScreenCaptureEnabled)
+		svc.startProcessWatcher()
 	}
 
 	defaultCfg := models.WatcherConfig{
@@ -73,16 +94,9 @@ func NewRuntimeService(ctx context.Context, settingsSvc *appsettings.Service, be
 	return svc
 }
 
-func (s *RuntimeService) StartWatcher(installDir string) error {
+// StartWatcher starts the file watcher with the currently configured settings.
+func (s *RuntimeService) StartWatcher() error {
 	current := s.settingsSvc.Get()
-	if installDir != "" {
-		current.KovaaksInstallDir = installDir
-		if err := s.settingsSvc.Update(current); err != nil {
-			return err
-		}
-		current = s.settingsSvc.Get()
-	}
-
 	finalPath := appsettings.ResolveKovaaksStatsDir(current.KovaaksInstallDir)
 	if finalPath == "" {
 		finalPath = appsettings.ResolveKovaaksStatsDir(appsettings.DefaultKovaaksInstallDir())
@@ -116,11 +130,33 @@ func (s *RuntimeService) StartWatcher(installDir string) error {
 	return nil
 }
 
+// StartWatcherAt updates the Kovaak's install directory and starts the file watcher.
+// Pass an empty string to keep the current directory.
+func (s *RuntimeService) StartWatcherAt(installDir string) error {
+	if installDir != "" {
+		current := s.settingsSvc.Get()
+		current.KovaaksInstallDir = installDir
+		if err := s.settingsSvc.Update(current); err != nil {
+			return err
+		}
+	}
+	return s.StartWatcher()
+}
+
 func (s *RuntimeService) StopWatcher() error {
 	if s.watcher == nil {
 		return nil
 	}
 	return s.watcher.Stop()
+}
+
+// RequestReplayCleanup schedules a non-blocking replay cleanup pass. The
+// store coalesces concurrent startup, settings, and replay-publication
+// triggers into a single worker.
+func (s *RuntimeService) RequestReplayCleanup() {
+	if s.runStore != nil {
+		s.runStore.RequestReplayCleanup()
+	}
 }
 
 func (s *RuntimeService) GetRecent(limit int) []models.RunRecord {
@@ -166,11 +202,32 @@ func (s *RuntimeService) OverwriteSettings(newS models.Settings) error {
 	}
 	s.mouse.SetBufferDuration(time.Duration(newS.MouseBufferMinutes) * time.Minute)
 
-	if newS.MouseTrackingEnabled != prevSettings.MouseTrackingEnabled {
-		if newS.MouseTrackingEnabled {
-			s.startMouseProcessWatcher()
+	trackingChanged := newS.MouseTrackingEnabled != prevSettings.MouseTrackingEnabled
+	captureChanged := newS.ScreenCaptureEnabled != prevSettings.ScreenCaptureEnabled
+	captureConfigChanged := newS.ScreenCaptureFPS != prevSettings.ScreenCaptureFPS ||
+		newS.ScreenCaptureResolution != prevSettings.ScreenCaptureResolution
+	cleanupSettingsChanged := newS.ReplayCleanupEnabled != prevSettings.ReplayCleanupEnabled ||
+		newS.ReplayRetentionDays != prevSettings.ReplayRetentionDays ||
+		newS.ReplayStorageLimitGB != prevSettings.ReplayStorageLimitGB
+
+	if trackingChanged || captureChanged {
+		if newS.MouseTrackingEnabled || newS.ScreenCaptureEnabled {
+			s.startProcessWatcher()
 		} else {
-			s.stopMouseProcessWatcher()
+			s.stopProcessWatcher()
+		}
+	}
+
+	// Capture settings are part of the encoded session format. Rotate the
+	// active session when they change instead of mutating fields that the
+	// already-running ffmpeg command has already copied into its arguments.
+	if captureChanged || captureConfigChanged {
+		if newS.ScreenCaptureEnabled {
+			s.reconfigureScreenCapture(newS, captureChanged || captureConfigChanged)
+		} else if captureChanged && newS.MouseTrackingEnabled {
+			// If the process watcher remains active for mouse tracking, it does
+			// not stop the screen provider for us.
+			s.disableScreenCapture()
 		}
 	}
 
@@ -185,7 +242,235 @@ func (s *RuntimeService) OverwriteSettings(newS models.Settings) error {
 	if err := s.updateWatcher(newS, needsWatcherRestart); err != nil {
 		return err
 	}
+	if cleanupSettingsChanged {
+		s.RequestReplayCleanup()
+	}
 	return nil
+}
+
+// configureScreenCaptureLocked selects the same encoder used for probing and
+// applies the complete configuration for the next capture session. The caller
+// must hold screenLifecycleMu.
+func (s *RuntimeService) configureScreenCaptureLocked(settings models.Settings) {
+	if s.screen == nil {
+		return
+	}
+
+	encoderName := ""
+	if s.encoder != nil && s.encoder.Available() {
+		info := s.encoder.Info()
+		encoderName = info.EncoderName
+		runtime.LogInfof(s.ctx, "screen: encoder=%s hardware=%v", info.EncoderName, info.IsHardware)
+		if !info.IsHardware {
+			if diag := s.encoder.ProbeDiagnostics(); diag != "" {
+				runtime.LogWarningf(s.ctx, "screen: hardware encoder probes failed; using software encoder:\n%s", diag)
+			}
+		}
+	} else if s.encoder != nil {
+		if diag := s.encoder.ProbeDiagnostics(); diag != "" {
+			runtime.LogWarningf(s.ctx, "screen: no encoder available; probe diagnostics:\n%s", diag)
+		}
+	}
+
+	s.screen.Configure(screen.CaptureConfig{
+		FPS:        settings.ScreenCaptureFPS,
+		Resolution: settings.ScreenCaptureResolution,
+		Encoder:    encoderName,
+	})
+}
+
+// stopAndFinalizeScreenCapture creates a complete session boundary.
+func (s *RuntimeService) stopAndFinalizeScreenCapture() {
+	s.screenLifecycleMu.Lock()
+	defer s.screenLifecycleMu.Unlock()
+	s.stopAndFinalizeScreenCaptureLocked()
+}
+
+// stopAndFinalizeScreenCaptureLocked creates a complete session boundary. It
+// deliberately finalizes the old provider session before any subsequent Start
+// can replace the provider's current session metadata.
+func (s *RuntimeService) stopAndFinalizeScreenCaptureLocked() {
+	if s.screen == nil {
+		return
+	}
+	if s.screen.Enabled() {
+		s.screen.Stop()
+		runtime.LogInfo(s.ctx, "screen capture stopped (session boundary)")
+	}
+
+	// Give the game a moment to flush the final stats/performance files before
+	// the synchronous scan assigns late runs to the new session.
+	time.Sleep(500 * time.Millisecond)
+	s.finalizeScreenCapture()
+}
+
+// reconfigureScreenCapture applies settings immediately when the game is
+// running. A running encoder cannot change frame rate, scaling, or GOP options
+// in place, so the old rolling session is closed and a new one is started.
+func (s *RuntimeService) reconfigureScreenCapture(settings models.Settings, rotate bool) {
+	s.screenLifecycleMu.Lock()
+	defer s.screenLifecycleMu.Unlock()
+
+	if s.screen == nil {
+		return
+	}
+	if rotate && s.screen.Enabled() {
+		s.stopAndFinalizeScreenCaptureLocked()
+	}
+
+	s.configureScreenCaptureLocked(settings)
+	if !settings.ScreenCaptureEnabled || !process.IsRunning(constants.KovaaksProcessName) || s.screen.Enabled() {
+		return
+	}
+	if err := s.screen.Start(); err != nil {
+		runtime.LogWarningf(s.ctx, "screen capture start failed after settings change: %v", err)
+		s.handleScreenCaptureFailure(err)
+		return
+	}
+	runtime.LogInfo(s.ctx, "screen capture started with updated settings")
+}
+
+func (s *RuntimeService) disableScreenCapture() {
+	s.screenLifecycleMu.Lock()
+	defer s.screenLifecycleMu.Unlock()
+	s.stopAndFinalizeScreenCaptureLocked()
+}
+
+func (s *RuntimeService) startConfiguredScreenCapture(settings models.Settings) {
+	s.screenLifecycleMu.Lock()
+	defer s.screenLifecycleMu.Unlock()
+
+	if s.screen == nil || !settings.ScreenCaptureEnabled || !process.IsRunning(constants.KovaaksProcessName) {
+		return
+	}
+	if s.screen.Enabled() {
+		return
+	}
+
+	s.configureScreenCaptureLocked(settings)
+	if err := s.screen.Start(); err != nil {
+		runtime.LogWarningf(s.ctx, "screen capture start failed: %v", err)
+		s.handleScreenCaptureFailure(err)
+		return
+	}
+	runtime.LogInfo(s.ctx, "screen capture started (process detected)")
+}
+
+// ScreenCaptureStatus is the authoritative status used by the settings UI.
+// Encoder availability is reported separately from active capture health.
+func (s *RuntimeService) ScreenCaptureStatus() screen.CaptureStatus {
+	settings := s.settingsSvc.Get()
+	providerStatus := screen.ProviderStatus{State: screen.CaptureStateIdle}
+	if s.screen != nil {
+		providerStatus = s.screen.Status()
+	}
+
+	status := screen.CaptureStatus{
+		Active:             providerStatus.Active,
+		Healthy:            providerStatus.Healthy,
+		State:              providerStatus.State,
+		Message:            providerStatus.Message,
+		LastError:          providerStatus.LastError,
+		LastFrameUnixMilli: providerStatus.LastFrameUnixMilli,
+	}
+	if s.encoder != nil && s.encoder.Available() {
+		info := s.encoder.Info()
+		status.EncoderName = info.EncoderName
+		status.Container = info.Container
+		status.IsHardware = info.IsHardware
+		status.Available = true
+	}
+
+	if providerStatus.State == screen.CaptureStateUnsupported {
+		status.Active = false
+		status.Healthy = false
+		status.State = "unavailable"
+		status.Message = providerStatus.Message
+		return status
+	}
+	if !settings.ScreenCaptureEnabled {
+		status.Active = false
+		status.Healthy = false
+		status.State = "disabled"
+		status.Message = "Screen capture is disabled."
+		return status
+	}
+	if !status.Available {
+		status.Active = false
+		status.Healthy = false
+		status.State = "unavailable"
+		status.Message = "FFmpeg or a compatible encoder is not available."
+		return status
+	}
+	if status.State == screen.CaptureStateError {
+		status.Message = "Screen capture encountered an error."
+		return status
+	}
+	if !process.IsRunning(constants.KovaaksProcessName) {
+		status.Active = false
+		status.Healthy = false
+		status.State = "ready"
+		status.Message = "Waiting for KovaaK's to start."
+		return status
+	}
+	if !status.Active {
+		status.State = "starting"
+		status.Message = "Capture is starting."
+	}
+	return status
+}
+
+func (s *RuntimeService) resetScreenRecovery() {
+	s.screenRecoveryMu.Lock()
+	s.screenRecoveryWindow = time.Time{}
+	s.screenRecoveryAttempts = 0
+	s.screenRecoveryMu.Unlock()
+}
+
+func (s *RuntimeService) handleScreenCaptureFailure(err error) {
+	if err == nil {
+		return
+	}
+	runtime.LogErrorf(s.ctx, "screen capture runtime failure: %v", err)
+
+	s.screenRecoveryMu.Lock()
+	now := time.Now()
+	if s.screenRecoveryWindow.IsZero() || now.Sub(s.screenRecoveryWindow) > 2*time.Minute {
+		s.screenRecoveryWindow = now
+		s.screenRecoveryAttempts = 0
+	}
+	if s.screenRecoveryAttempts >= 3 {
+		s.screenRecoveryMu.Unlock()
+		runtime.LogWarning(s.ctx, "screen capture recovery limit reached; leaving capture disabled until the next KovaaK's session")
+		return
+	}
+	s.screenRecoveryAttempts++
+	attempt := s.screenRecoveryAttempts
+	s.screenRecoveryMu.Unlock()
+
+	go func() {
+		timer := time.NewTimer(time.Duration(attempt) * time.Second)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-s.ctx.Done():
+			return
+		}
+
+		s.screenLifecycleMu.Lock()
+		defer s.screenLifecycleMu.Unlock()
+		settings := s.settingsSvc.Get()
+		if !settings.ScreenCaptureEnabled || !process.IsRunning(constants.KovaaksProcessName) {
+			return
+		}
+		s.stopAndFinalizeScreenCaptureLocked()
+		s.configureScreenCaptureLocked(settings)
+		if err := s.screen.Start(); err != nil {
+			runtime.LogWarningf(s.ctx, "screen capture recovery attempt %d failed: %v", attempt, err)
+			return
+		}
+		runtime.LogInfof(s.ctx, "screen capture recovered on attempt %d", attempt)
+	}()
 }
 
 func (s *RuntimeService) updateWatcher(newS models.Settings, needsRestart bool) error {
@@ -269,7 +554,7 @@ func (s *RuntimeService) handleRunParsed(rec models.RunRecord) {
 	}(rec.FilePath, settings.AnonymousEnabled)
 }
 
-func (s *RuntimeService) startMouseProcessWatcher() {
+func (s *RuntimeService) startProcessWatcher() {
 	if s.procWatcherStop != nil {
 		return
 	}
@@ -279,21 +564,66 @@ func (s *RuntimeService) startMouseProcessWatcher() {
 
 	s.procWatcher = process.NewWatcher(constants.KovaaksProcessName,
 		func() {
-			if err := s.mouse.Start(); err != nil {
-				runtime.LogWarningf(s.ctx, "mouse tracker start failed: %v", err)
-			} else {
-				runtime.LogInfo(s.ctx, "mouse tracker started (process detected)")
+			runtime.LogInfo(s.ctx, "watcher: KovaaK's process detected (onStart)")
+			cur := s.settingsSvc.Get()
+			runtime.LogInfof(s.ctx, "watcher: mouseTracking=%v screenCapture=%v", cur.MouseTrackingEnabled, cur.ScreenCaptureEnabled)
+			if cur.MouseTrackingEnabled {
+				if err := s.mouse.Start(); err != nil {
+					runtime.LogWarningf(s.ctx, "mouse tracker start failed: %v", err)
+				} else {
+					runtime.LogInfo(s.ctx, "mouse tracker started (process detected)")
+				}
+			}
+			s.resetScreenRecovery()
+			if cur.ScreenCaptureEnabled {
+				runtime.LogInfo(s.ctx, "watcher: starting screen capture")
+				s.startConfiguredScreenCapture(cur)
 			}
 		},
 		func() {
-			s.mouse.Stop()
-			runtime.LogInfo(s.ctx, "mouse tracker stopped (process exited)")
+			runtime.LogInfo(s.ctx, "watcher: KovaaK's process exited (onStop)")
+			if s.mouse.Enabled() {
+				s.mouse.Stop()
+				runtime.LogInfo(s.ctx, "mouse tracker stopped (process exited)")
+			}
+			if s.screen.Enabled() {
+				runtime.LogInfo(s.ctx, "watcher: stopping screen capture")
+			} else {
+				runtime.LogDebug(s.ctx, "watcher: screen capture was not enabled, skipping stop")
+			}
+
+			// Stop finalizes the temp recording, then scan after a short delay so
+			// KovaaK's has finished closing the stats files. Finalization trims
+			// both runs found by this scan and runs queued by earlier fsnotify
+			// events while capture was still active.
+			s.stopAndFinalizeScreenCapture()
 		},
 	)
 	go s.procWatcher.Start(ctx)
 }
 
-func (s *RuntimeService) stopMouseProcessWatcher() {
+// Shutdown stops capture on a real app exit, gives active replay exports a
+// bounded opportunity to publish, and then removes temporary segment
+// directories. Startup cleanup remains the fallback for a trim that outlives
+// the shutdown window or an externally terminated RefleK's process.
+func (s *RuntimeService) Shutdown() {
+	s.stopProcessWatcher()
+	if s.runStore != nil {
+		waitCtx, cancel := context.WithTimeout(
+			context.Background(),
+			time.Duration(constants.ScreenCaptureShutdownWaitSeconds)*time.Second,
+		)
+		if !s.runStore.WaitForScreenTrims(waitCtx) {
+			runtime.LogWarning(s.ctx, "screen: timed out waiting for replay exports during shutdown")
+		}
+		cancel()
+	}
+	if err := screen.CleanupAbandonedSessions(); err != nil {
+		runtime.LogWarningf(s.ctx, "screen: clean capture sessions on shutdown: %v", err)
+	}
+}
+
+func (s *RuntimeService) stopProcessWatcher() {
 	if s.procWatcherStop != nil {
 		s.procWatcherStop()
 		s.procWatcherStop = nil
@@ -304,4 +634,39 @@ func (s *RuntimeService) stopMouseProcessWatcher() {
 		s.mouse.Stop()
 		runtime.LogInfo(s.ctx, "mouse tracker stopped (tracking disabled)")
 	}
+	if s.screen != nil && s.screen.Enabled() {
+		runtime.LogInfo(s.ctx, "screen capture stopped (tracking disabled)")
+	}
+	s.stopAndFinalizeScreenCapture()
+}
+
+// finalizeScreenCapture waits for in-progress watcher ingestion to register
+// its trim before the provider can release a stopped session. This is needed
+// for both process exit and capture being disabled from settings.
+func (s *RuntimeService) finalizeScreenCapture() {
+	if s.watcher != nil {
+		// Scan synchronously, then wait for any concurrent fsnotify ingestion.
+		// This makes settings-disable and app-shutdown retain the same final-run
+		// guarantee as normal process exit.
+		s.watcher.ScanNow()
+		idleCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		idle := s.watcher.WaitForIdle(idleCtx)
+		cancel()
+		if !idle {
+			runtime.LogWarning(s.ctx, "watcher: timed out waiting for final run ingestion")
+		}
+	}
+	if s.runStore != nil {
+		s.runStore.FinalizeScreenCapture()
+	}
+}
+
+// ScreenCaptureProvider exposes screen capture frames for ingest.
+func (s *RuntimeService) ScreenCaptureProvider() screen.Provider {
+	return s.screen
+}
+
+// Encoder returns the configured video encoder.
+func (s *RuntimeService) Encoder() *screen.Encoder {
+	return s.encoder
 }

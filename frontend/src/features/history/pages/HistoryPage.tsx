@@ -1,15 +1,16 @@
-
-import { Loading } from '@/shared/components'
-import { useStore } from '@/shared/hooks'
-import { HistoryRunDetailPane } from '../components/HistoryRunDetailPane'
-import { HistoryRunList } from '../components/HistoryRunList'
-import { HistorySessionList } from '../components/HistorySessionList'
-import { HistorySessionOverview } from '../components/HistorySessionOverview'
-import { useHistoryPageState } from '../hooks/useHistoryPageState'
+import { Loading } from "@/shared/components";
+import { useStore } from "@/shared/hooks";
+import { useI18n } from "@/shared/lib";
+import { HistoryRunDetailPane } from "../components/HistoryRunDetailPane";
+import { HistoryRunList } from "../components/HistoryRunList";
+import { HistorySessionList } from "../components/HistorySessionList";
+import { HistorySessionOverview } from "../components/HistorySessionOverview";
+import { useHistoryPageState } from "../hooks/useHistoryPageState";
 
 export function HistoryPage() {
-  const allSessions = useStore(s => s.sessions)
-  const runHydration = useStore(s => s.runHydration)
+  const { t } = useI18n();
+  const allSessions = useStore((s) => s.sessions);
+  const runHydration = useStore((s) => s.runHydration);
   const {
     sessions,
     filteredSessions,
@@ -49,14 +50,18 @@ export function HistoryPage() {
     comparePb,
     clearPrimaryRun,
     clearComparison,
-  } = useHistoryPageState()
+  } = useHistoryPageState();
 
   if (allSessions.length === 0 && runHydration.loading) {
-    const label = runHydration.total > 0
-      ? `Loading run history ${Math.min(runHydration.loaded, runHydration.total)}/${runHydration.total}...`
-      : 'Loading run history...'
+    const label =
+      runHydration.total > 0
+        ? t("history.page.loadingProgress", {
+            loaded: Math.min(runHydration.loaded, runHydration.total),
+            total: runHydration.total,
+          })
+        : t("history.page.loading");
 
-    return <Loading label={label} />
+    return <Loading label={label} />;
   }
 
   return (
@@ -69,7 +74,7 @@ export function HistoryPage() {
           query={sessionQuery}
           onQueryChange={setSessionQuery}
           onSelectSession={setSelectedSessionId}
-          onToggleCollapsed={() => setSessionListCollapsed(v => !v)}
+          onToggleCollapsed={() => setSessionListCollapsed((v) => !v)}
           sort={sessionSort}
           onSortChange={setSessionSort}
           filterPb={sessionFilterPb}
@@ -87,8 +92,16 @@ export function HistoryPage() {
               onClose={() => setRunInspectorOpen(false)}
               onClearPrimaryRun={clearPrimaryRun}
               onClearComparison={clearComparison}
-              isPrimaryPb={!!primaryRun && !!pbRunForPrimary && primaryRun.id === pbRunForPrimary.id}
-              isComparePb={!!compareRun && !!pbRunForPrimary && compareRun.id === pbRunForPrimary.id}
+              isPrimaryPb={
+                !!primaryRun &&
+                !!pbRunForPrimary &&
+                primaryRun.id === pbRunForPrimary.id
+              }
+              isComparePb={
+                !!compareRun &&
+                !!pbRunForPrimary &&
+                compareRun.id === pbRunForPrimary.id
+              }
               onComparePb={comparePb}
             />
           ) : (
@@ -114,8 +127,8 @@ export function HistoryPage() {
           inspectorOpen={runInspectorOpen}
           selectedScenario={selectedScenario}
           onQueryChange={setRunQuery}
-          onToggleCollapsed={() => setRunListCollapsed(v => !v)}
-          onToggleInspector={() => setRunInspectorOpen(v => !v)}
+          onToggleCollapsed={() => setRunListCollapsed((v) => !v)}
+          onToggleInspector={() => setRunInspectorOpen((v) => !v)}
           onSelectRun={selectRun}
           onCompareRun={compareRunWithPrimary}
           sort={runSort}
@@ -125,5 +138,5 @@ export function HistoryPage() {
         />
       </div>
     </div>
-  )
+  );
 }

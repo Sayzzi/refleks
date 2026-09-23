@@ -1,8 +1,9 @@
-import { PerformanceVsSensWidget } from '@/features/history/components/PerformanceVsSensWidget'
-import { SessionScenarioRadarWidget } from '@/features/history/components/SessionScenarioRadarWidget'
-import { Loading } from '@/shared/components'
-import { useStore } from '@/shared/hooks'
-import { BenchmarkOverviewWidget } from '../components/BenchmarkOverviewWidget'
+import { PerformanceVsSensWidget } from "@/features/history/components/PerformanceVsSensWidget";
+import { SessionScenarioRadarWidget } from "@/features/history/components/SessionScenarioRadarWidget";
+import { Loading } from "@/shared/components";
+import { useI18n } from "@/shared/lib";
+import { useStore } from "@/shared/hooks";
+import { BenchmarkOverviewWidget } from "../components/BenchmarkOverviewWidget";
 import {
   LastRunWidget,
   RecentScoresWidget,
@@ -10,20 +11,25 @@ import {
   SessionProgressWidget,
   SessionTimeWidget,
   StreakPlaytimeWidget,
-} from '../components/SessionWidgets'
-import { useRecentSessionSnapshot } from '../hooks/useRecentSessionSnapshot'
+} from "../components/SessionWidgets";
+import { useRecentSessionSnapshot } from "../hooks/useRecentSessionSnapshot";
 
 export function OverviewPage() {
-  const snapshot = useRecentSessionSnapshot()
-  const sessions = useStore(s => s.sessions)
-  const runHydration = useStore(s => s.runHydration)
+  const { t } = useI18n();
+  const snapshot = useRecentSessionSnapshot();
+  const sessions = useStore((s) => s.sessions);
+  const runHydration = useStore((s) => s.runHydration);
 
   if (sessions.length === 0 && runHydration.loading) {
-    const label = runHydration.total > 0
-      ? `Loading run history ${Math.min(runHydration.loaded, runHydration.total)}/${runHydration.total}...`
-      : 'Loading run history...'
+    const label =
+      runHydration.total > 0
+        ? t("overview.page.loadingHistoryProgress", {
+            loaded: Math.min(runHydration.loaded, runHydration.total),
+            total: runHydration.total,
+          })
+        : t("overview.page.loadingHistory");
 
-    return <Loading label={label} />
+    return <Loading label={label} />;
   }
 
   return (
@@ -47,10 +53,13 @@ export function OverviewPage() {
         <BenchmarkOverviewWidget />
 
         <div className="grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-2">
-          <PerformanceVsSensWidget allowScopeSelection className="h-[340px]"/>
-          <SessionScenarioRadarWidget className="h-[340px]"/>
+          <PerformanceVsSensWidget
+            allowScopeSelection
+            className="h-[21.25rem]"
+          />
+          <SessionScenarioRadarWidget className="h-[21.25rem]" />
         </div>
       </div>
     </div>
-  )
+  );
 }

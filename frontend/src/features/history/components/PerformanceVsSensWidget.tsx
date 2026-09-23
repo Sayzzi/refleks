@@ -1,170 +1,259 @@
-import { formatNumber } from '@/features/benchmarks/lib/detailFormatting'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Widget } from '@/shared/components'
-import type { ChartConfig } from '@/shared/components/ui/chart'
-import { ChartContainer, ChartTooltip, ChartTooltipContent } from '@/shared/components/ui/chart'
-import { usePersistedState, useStore } from '@/shared/hooks'
+import { formatNumber } from "@/features/benchmarks/lib/detailFormatting";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Widget,
+} from "@/shared/components";
+import type { ChartConfig } from "@/shared/components/ui/chart";
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+} from "@/shared/components/ui/chart";
+import { useChartAnimation, usePersistedState, useStore } from "@/shared/hooks";
 import {
   CHART_SERIES_COLORS,
   CHART_STYLE,
   STORAGE_KEYS,
+  getLocale,
   getScenarioName,
   readRunAccuracy,
   readRunScore,
   readRunTimestamp,
-} from '@/shared/lib'
-import type { RunRecord, Session } from '@/shared/types'
-import { useMemo } from 'react'
-import { CartesianGrid, Scatter, ScatterChart, XAxis, YAxis } from 'recharts'
+  translate,
+  useI18n,
+  type MessageKey,
+} from "@/shared/lib";
+import type { RunRecord, Session } from "@/shared/types";
+import { useMemo } from "react";
+import { CartesianGrid, Scatter, ScatterChart, XAxis, YAxis } from "recharts";
 
-type MetricKey = 'score' | 'accuracy' | 'ttk'
-type DataScopeKey = 'session' | 'all'
+type MetricKey = "score" | "accuracy" | "ttk";
+type DataScopeKey = "session" | "all";
 
 type SensitivityPoint = {
-  x: number
-  performance: number
-  rawSensitivity: number
-  runLabel: string
-}
+  x: number;
+  performance: number;
+  rawSensitivity: number;
+  runLabel: string;
+};
 
 type PerformanceVsSensWidgetProps = {
-  sessions?: Session[]
-  scenarioName?: string | null
-  title?: string
-  description?: string
-  className?: string
-  allowScopeSelection?: boolean
-}
+  sessions?: Session[];
+  scenarioName?: string | null;
+  title?: string;
+  description?: string;
+  className?: string;
+  allowScopeSelection?: boolean;
+};
 
-const metricOptions: Array<{ value: MetricKey; label: string }> = [
-  { value: 'score', label: 'Score' },
-  { value: 'accuracy', label: 'Accuracy (%)' },
-  { value: 'ttk', label: 'Real Avg TTK (s)' },
-]
+const metricOptions: Array<{ value: MetricKey; labelKey: MessageKey }> = [
+  { value: "score", labelKey: "history.performanceVsSens.metricScore" },
+  { value: "accuracy", labelKey: "history.performanceVsSens.metricAccuracy" },
+  { value: "ttk", labelKey: "history.performanceVsSens.metricTtk" },
+];
 
 const metricColors: Record<MetricKey, string> = {
   score: CHART_SERIES_COLORS.scoreHistory,
   accuracy: CHART_SERIES_COLORS.accuracy,
   ttk: CHART_SERIES_COLORS.ttk,
+};
+
+const scopeOptions: Array<{ value: DataScopeKey; labelKey: MessageKey }> = [
+  { value: "session", labelKey: "history.performanceVsSens.scopeSession" },
+  { value: "all", labelKey: "history.performanceVsSens.scopeAll" },
+];
+
+const DEFAULT_METRIC: MetricKey = "score";
+const DEFAULT_SCOPE: DataScopeKey = "all";
+
+let dateTimeFormatterLocale: string | null = null;
+let dateTimeFormatter: Intl.DateTimeFormat | null = null;
+function getDateTimeFormatter(): Intl.DateTimeFormat {
+  const locale = getLocale();
+  if (!dateTimeFormatter || dateTimeFormatterLocale !== locale) {
+    dateTimeFormatterLocale = locale;
+    dateTimeFormatter = new Intl.DateTimeFormat(locale, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+  return dateTimeFormatter;
 }
-
-const scopeOptions: Array<{ value: DataScopeKey; label: string }> = [
-  { value: 'session', label: 'This Session' },
-  { value: 'all', label: 'All History' },
-]
-
-const DEFAULT_METRIC: MetricKey = 'score'
-const DEFAULT_SCOPE: DataScopeKey = 'all'
-
-const dateTimeFormatter = new Intl.DateTimeFormat('en-US', {
-  month: 'short',
-  day: 'numeric',
-  hour: 'numeric',
-  minute: '2-digit',
-})
 
 export function PerformanceVsSensWidget({
   sessions,
   scenarioName,
-  title = 'Performance vs Sensitivity',
+  title,
   description,
   className,
   allowScopeSelection = false,
 }: PerformanceVsSensWidgetProps) {
-  const storeSessions = useStore(state => state.sessions)
-  const currentSession = storeSessions[0] ?? null
-  const [storedMetric, setStoredMetric] = usePersistedState<MetricKey>(STORAGE_KEYS.performanceVsSensMetric, DEFAULT_METRIC)
-  const [storedScope, setStoredScope] = usePersistedState<DataScopeKey>(STORAGE_KEYS.performanceVsSensScope, DEFAULT_SCOPE)
+  const { t } = useI18n();
+  const storeSessions = useStore((state) => state.sessions);
+  const currentSession = storeSessions[0] ?? null;
+  const [storedMetric, setStoredMetric] = usePersistedState<MetricKey>(
+    STORAGE_KEYS.performanceVsSensMetric,
+    DEFAULT_METRIC,
+  );
+  const [storedScope, setStoredScope] = usePersistedState<DataScopeKey>(
+    STORAGE_KEYS.performanceVsSensScope,
+    DEFAULT_SCOPE,
+  );
 
-  const metric = isMetricKey(storedMetric) ? storedMetric : DEFAULT_METRIC
-  const scope = isDataScopeKey(storedScope) ? storedScope : DEFAULT_SCOPE
+  const metric = isMetricKey(storedMetric) ? storedMetric : DEFAULT_METRIC;
+  const scope = isDataScopeKey(storedScope) ? storedScope : DEFAULT_SCOPE;
 
-  const showScopeSelector = allowScopeSelection && sessions === undefined
-  const sourceSessions = sessions
-    ?? (showScopeSelector && scope === 'session'
-      ? (currentSession ? [currentSession] : [])
-      : storeSessions)
+  const showScopeSelector = allowScopeSelection && sessions === undefined;
+  const sourceSessions =
+    sessions ??
+    (showScopeSelector && scope === "session"
+      ? currentSession
+        ? [currentSession]
+        : []
+      : storeSessions);
 
   const chartData = useMemo(
     () => buildChartData(sourceSessions, scenarioName ?? null, metric),
     [metric, scenarioName, sourceSessions],
-  )
-  const metricLabel = metricOptions.find(option => option.value === metric)?.label ?? 'Performance'
+  );
+  const metricLabel = t(
+    metricOptions.find((option) => option.value === metric)?.labelKey ??
+      "history.performanceVsSens.performance",
+  );
   const scopeLabel = sessions
-    ? 'This Session'
-    : (showScopeSelector ? scopeOptions.find(option => option.value === scope)?.label : 'All History') ?? 'All History'
+    ? t("history.performanceVsSens.scopeSession")
+    : t(
+        showScopeSelector
+          ? (scopeOptions.find((option) => option.value === scope)?.labelKey ??
+              "history.performanceVsSens.scopeAll")
+          : "history.performanceVsSens.scopeAll",
+      );
+  const resolvedTitle = title ?? t("history.performanceVsSens.title");
   const headerActions = (
     <div className="flex items-center gap-2">
       {showScopeSelector && (
-        <Select value={scope} onValueChange={value => setStoredScope(isDataScopeKey(value) ? value : DEFAULT_SCOPE)}>
-          <SelectTrigger className="h-7 w-auto min-w-0 max-w-[180px] px-2 text-xs bg-surface-subtle">
-            <SelectValue placeholder="Scope" />
+        <Select
+          value={scope}
+          onValueChange={(value) =>
+            setStoredScope(isDataScopeKey(value) ? value : DEFAULT_SCOPE)
+          }
+        >
+          <SelectTrigger className="h-7 w-auto min-w-0 max-w-[11.25rem] px-2 text-xs bg-surface-subtle">
+            <SelectValue
+              placeholder={t("history.performanceVsSens.scopePlaceholder")}
+            />
           </SelectTrigger>
           <SelectContent>
-            {scopeOptions.map(option => (
+            {scopeOptions.map((option) => (
               <SelectItem key={option.value} value={option.value}>
-                {option.label}
+                {t(option.labelKey)}
               </SelectItem>
             ))}
           </SelectContent>
         </Select>
       )}
 
-      <Select value={metric} onValueChange={value => setStoredMetric(isMetricKey(value) ? value : DEFAULT_METRIC)}>
-        <SelectTrigger className="h-7 w-auto min-w-0 max-w-[180px] px-2 text-xs bg-surface-subtle">
-          <SelectValue placeholder="Metric" />
+      <Select
+        value={metric}
+        onValueChange={(value) =>
+          setStoredMetric(isMetricKey(value) ? value : DEFAULT_METRIC)
+        }
+      >
+        <SelectTrigger className="h-7 w-auto min-w-0 max-w-[11.25rem] px-2 text-xs bg-surface-subtle">
+          <SelectValue
+            placeholder={t("history.performanceVsSens.metricPlaceholder")}
+          />
         </SelectTrigger>
         <SelectContent>
-          {metricOptions.map(option => (
+          {metricOptions.map((option) => (
             <SelectItem key={option.value} value={option.value}>
-              {option.label}
+              {t(option.labelKey)}
             </SelectItem>
           ))}
         </SelectContent>
       </Select>
     </div>
-  )
+  );
 
   if (!chartData.scenarioName) {
     return (
       <Widget
-        title={title}
-        description={description ?? 'Play a scenario to compare sensitivity against performance.'}
+        title={resolvedTitle}
+        description={
+          description ?? t("history.performanceVsSens.emptyDescription")
+        }
         headerAction={headerActions}
         className={className}
       >
-        <EmptyState message="No recent scenario found yet. Play a run with cm/360 data to populate this widget." />
+        <EmptyState message={t("history.performanceVsSens.noRecentScenario")} />
       </Widget>
-    )
+    );
   }
 
   if (chartData.points.length === 0) {
     return (
       <Widget
-        title={title}
-        description={description ?? `${chartData.scenarioName} · ${metricLabel} · ${scopeLabel}`}
+        title={resolvedTitle}
+        description={
+          description ??
+          t("history.performanceVsSens.descriptionLine", {
+            scenario: chartData.scenarioName,
+            metric: metricLabel,
+            scope: scopeLabel,
+          })
+        }
         headerAction={headerActions}
         className={className}
       >
-        <EmptyState message={`No usable sensitivity data found for ${chartData.scenarioName}.`} />
+        <EmptyState
+          message={t("history.performanceVsSens.noUsableSensData", {
+            scenario: chartData.scenarioName,
+          })}
+        />
       </Widget>
-    )
+    );
   }
 
-  const modalTitle = `${chartData.scenarioName} · ${title}`
+  const modalTitle = `${chartData.scenarioName} · ${resolvedTitle}`;
 
   return (
     <Widget
-      title={title}
-      description={description ?? `${chartData.scenarioName} · ${chartData.points.length} runs · ${metricLabel} · ${scopeLabel}`}
+      title={resolvedTitle}
+      description={
+        description ??
+        t("history.performanceVsSens.descriptionLineRuns", {
+          scenario: chartData.scenarioName,
+          count: chartData.points.length,
+          runs: t("history.page.runs", { count: chartData.points.length }),
+          metric: metricLabel,
+          scope: scopeLabel,
+        })
+      }
       headerAction={headerActions}
       modalTitle={modalTitle}
       modalControls={headerActions}
-      modalContent={<PerformanceVsSensChartContent data={chartData} metric={metric} metricLabel={metricLabel} />}
+      modalContent={
+        <PerformanceVsSensChartContent
+          data={chartData}
+          metric={metric}
+          metricLabel={metricLabel}
+        />
+      }
       className={className}
     >
-      <PerformanceVsSensChartContent data={chartData} metric={metric} metricLabel={metricLabel} />
+      <PerformanceVsSensChartContent
+        data={chartData}
+        metric={metric}
+        metricLabel={metricLabel}
+      />
     </Widget>
-  )
+  );
 }
 
 function PerformanceVsSensChartContent({
@@ -172,21 +261,30 @@ function PerformanceVsSensChartContent({
   metric,
   metricLabel,
 }: {
-  data: ReturnType<typeof buildChartData>
-  metric: MetricKey
-  metricLabel: string
+  data: ReturnType<typeof buildChartData>;
+  metric: MetricKey;
+  metricLabel: string;
 }) {
+  const { t } = useI18n();
+  const { ref: chartRef, animationProps, revealed } = useChartAnimation();
   const chartConfig: ChartConfig = {
     performance: {
       label: metricLabel,
       color: metricColors[metric],
     },
-  }
+  };
 
   return (
     <div className="h-full w-full">
-      <ChartContainer config={chartConfig} className="aspect-auto h-full w-full">
-        <ScatterChart margin={{ top: 12, right: 12, left: 6, bottom: 4 }}>
+      <ChartContainer
+        ref={chartRef}
+        config={chartConfig}
+        className="aspect-auto h-full w-full"
+      >
+        <ScatterChart
+          key={revealed ? "revealed" : "hidden"}
+          margin={{ top: 12, right: 12, left: 6, bottom: 4 }}
+        >
           <CartesianGrid vertical={false} />
           <XAxis
             dataKey="x"
@@ -195,7 +293,7 @@ function PerformanceVsSensChartContent({
             axisLine={false}
             tickMargin={8}
             domain={data.xDomain}
-            tickFormatter={value => formatNumber(value, 1)}
+            tickFormatter={(value) => formatNumber(value, 1)}
           />
           <YAxis
             tickLine={false}
@@ -203,38 +301,45 @@ function PerformanceVsSensChartContent({
             tickMargin={8}
             width={56}
             domain={data.yDomain}
-            tickFormatter={value => formatMetricTick(value, metric)}
+            tickFormatter={(value) => formatMetricTick(value, metric)}
           />
 
           <ChartTooltip
             shared={false}
             cursor={false}
-            content={(
+            content={
               <ChartTooltipContent
                 labelFormatter={(_, payload) => {
-                  const point = payload?.[0]?.payload as SensitivityPoint | undefined
-                  return point?.runLabel ?? null
+                  const point = payload?.[0]?.payload as
+                    SensitivityPoint | undefined;
+                  return point?.runLabel ?? null;
                 }}
                 formatter={(value, _name, item) => {
-                  const point = item?.payload as SensitivityPoint | undefined
+                  const point = item?.payload as SensitivityPoint | undefined;
                   // Only show formatter for the performance dataKey, not for x-axis
-                  if (!point || item.dataKey !== 'performance') return null
+                  if (!point || item.dataKey !== "performance") return null;
 
                   return (
                     <div className="grid gap-0.5 text-popover-foreground/75">
                       <div>
-                        Sensitivity:{' '}
-                        <span className="font-medium text-popover-foreground">{formatNumber(point.rawSensitivity, 2)} cm/360</span>
+                        {t("history.performanceVsSens.tooltipSensitivity")}
+                        <span className="font-medium text-popover-foreground">
+                          {formatNumber(point.rawSensitivity, 2)} cm/360
+                        </span>
                       </div>
                       <div>
-                        {metricLabel}:{' '}
-                        <span className="font-medium text-popover-foreground">{formatMetricValue(Number(value), metric)}</span>
+                        {t("history.performanceVsSens.tooltipMetric", {
+                          metric: metricLabel,
+                        })}
+                        <span className="font-medium text-popover-foreground">
+                          {formatMetricValue(Number(value), metric)}
+                        </span>
                       </div>
                     </div>
-                  )
+                  );
                 }}
               />
-            )}
+            }
           />
 
           <Scatter
@@ -243,28 +348,32 @@ function PerformanceVsSensChartContent({
             dataKey="performance"
             fill="var(--color-performance)"
             stroke="var(--color-performance)"
-            isAnimationActive={false}
+            {...animationProps}
             r={CHART_STYLE.scatterPointRadius}
           />
         </ScatterChart>
       </ChartContainer>
     </div>
-  )
+  );
 }
 
-function buildChartData(sessions: Session[], scenarioName: string | null, metric: MetricKey) {
-  let resolvedScenarioName = scenarioName?.trim() || null
+function buildChartData(
+  sessions: Session[],
+  scenarioName: string | null,
+  metric: MetricKey,
+) {
+  let resolvedScenarioName = scenarioName?.trim() || null;
 
   if (!resolvedScenarioName) {
     for (const session of sessions) {
       for (const item of session.items) {
-        const name = getScenarioName(item).trim()
-        if (!name) continue
-        resolvedScenarioName = name
-        break
+        const name = getScenarioName(item).trim();
+        if (!name) continue;
+        resolvedScenarioName = name;
+        break;
       }
 
-      if (resolvedScenarioName) break
+      if (resolvedScenarioName) break;
     }
   }
 
@@ -274,31 +383,31 @@ function buildChartData(sessions: Session[], scenarioName: string | null, metric
       points: [] as SensitivityPoint[],
       xDomain: [0, 1] as [number, number],
       yDomain: [0, 1] as [number, number],
-    }
+    };
   }
 
-  const points: SensitivityPoint[] = []
-  let runIndex = 0
+  const points: SensitivityPoint[] = [];
+  let runIndex = 0;
 
   for (const session of sessions) {
     for (const item of session.items) {
-      if (getScenarioName(item).trim() !== resolvedScenarioName) continue
+      if (getScenarioName(item).trim() !== resolvedScenarioName) continue;
 
-      const rawSensitivity = Number(item.stats?.['cm/360'] ?? 0)
-      if (!Number.isFinite(rawSensitivity) || rawSensitivity <= 0) continue
+      const rawSensitivity = Number(item.stats?.summary.cm360 ?? 0);
+      if (!Number.isFinite(rawSensitivity) || rawSensitivity <= 0) continue;
 
-      const performance = readMetricValue(item, metric)
-      if (performance === null) continue
+      const performance = readMetricValue(item, metric);
+      if (performance === null) continue;
 
-      const timestamp = readTimestamp(item)
-      runIndex += 1
+      const timestamp = readTimestamp(item);
+      runIndex += 1;
 
       points.push({
         x: rawSensitivity,
         performance,
         rawSensitivity,
         runLabel: formatRunLabel(timestamp, runIndex),
-      })
+      });
     }
   }
 
@@ -308,76 +417,98 @@ function buildChartData(sessions: Session[], scenarioName: string | null, metric
       points: [] as SensitivityPoint[],
       xDomain: [0, 1] as [number, number],
       yDomain: [0, 1] as [number, number],
-    }
+    };
   }
 
-  const xDomain = buildNumericDomain(points.map(point => point.x), 0.08, 0.5)
-  const yDomain = buildNumericDomain(points.map(point => point.performance), 0.12, metric === 'ttk' ? 0.03 : 1)
+  const xDomain = buildNumericDomain(
+    points.map((point) => point.x),
+    0.08,
+    0.5,
+  );
+  const yDomain = buildNumericDomain(
+    points.map((point) => point.performance),
+    0.12,
+    metric === "ttk" ? 0.03 : 1,
+  );
 
   return {
     scenarioName: resolvedScenarioName,
     points,
     xDomain,
     yDomain,
-  }
+  };
 }
 
 function readMetricValue(item: RunRecord, metric: MetricKey): number | null {
-  if (metric === 'score') {
-    return readRunScore(item)
+  if (metric === "score") {
+    return readRunScore(item);
   }
 
-  if (metric === 'accuracy') {
-    const accuracy = readRunAccuracy(item)
-    return accuracy !== null && Number.isFinite(accuracy) ? accuracy : null
+  if (metric === "accuracy") {
+    const accuracy = readRunAccuracy(item);
+    return accuracy !== null && Number.isFinite(accuracy) ? accuracy : null;
   }
 
-  const ttk = Number(item.stats?.['Real Avg TTK'] ?? NaN)
-  return Number.isFinite(ttk) ? ttk : null
+  const ttk = Number(item.stats?.summary.realAvgTtk ?? NaN);
+  return Number.isFinite(ttk) ? ttk : null;
 }
 
 function readTimestamp(item: RunRecord): number {
-  return readRunTimestamp(item)
+  return readRunTimestamp(item);
 }
 
 function isMetricKey(value: string): value is MetricKey {
-  return metricOptions.some(option => option.value === value)
+  return metricOptions.some((option) => option.value === value);
 }
 
 function isDataScopeKey(value: string): value is DataScopeKey {
-  return scopeOptions.some(option => option.value === value)
+  return scopeOptions.some((option) => option.value === value);
 }
 
-function buildNumericDomain(values: number[], padRatio: number, minPad: number): [number, number] {
-  if (values.length === 0) return [0, 1]
+function buildNumericDomain(
+  values: number[],
+  padRatio: number,
+  minPad: number,
+): [number, number] {
+  if (values.length === 0) return [0, 1];
 
-  const min = Math.min(...values)
-  const max = Math.max(...values)
+  const min = Math.min(...values);
+  const max = Math.max(...values);
   if (min === max) {
-    const pad = Math.max(minPad, Math.abs(min) * padRatio)
-    return [min - pad, max + pad]
+    const pad = Math.max(minPad, Math.abs(min) * padRatio);
+    return [min - pad, max + pad];
   }
 
-  const span = max - min
-  const pad = Math.max(span * padRatio, minPad)
-  return [min - pad, max + pad]
+  const span = max - min;
+  const pad = Math.max(span * padRatio, minPad);
+  return [min - pad, max + pad];
 }
 
 function formatRunLabel(timestamp: number, runIndex: number): string {
-  if (timestamp <= 0) return `Run ${runIndex}`
-  return `Run ${runIndex} · ${dateTimeFormatter.format(new Date(timestamp))}`
+  if (timestamp <= 0)
+    return translate("history.performanceVsSens.runLabel", {
+      count: runIndex,
+    });
+  return translate("history.performanceVsSens.runLabelWithDate", {
+    count: runIndex,
+    date: getDateTimeFormatter().format(new Date(timestamp)),
+  });
 }
 
 function formatMetricTick(value: number, metric: MetricKey): string {
-  return formatMetricValue(value, metric)
+  return formatMetricValue(value, metric);
 }
 
 function formatMetricValue(value: number, metric: MetricKey): string {
-  if (metric === 'accuracy') return `${formatNumber(value, 1)}%`
-  if (metric === 'ttk') return `${formatNumber(value, 3)}s`
-  return formatNumber(value, 0)
+  if (metric === "accuracy") return `${formatNumber(value, 1)}%`;
+  if (metric === "ttk") return `${formatNumber(value, 3)}s`;
+  return formatNumber(value, 0);
 }
 
 function EmptyState({ message }: { message: string }) {
-  return <div className="rounded-xl bg-surface-muted-strong p-4 text-sm text-surface-muted-foreground">{message}</div>
+  return (
+    <div className="rounded-xl bg-surface-muted-strong p-4 text-sm text-surface-muted-foreground">
+      {message}
+    </div>
+  );
 }

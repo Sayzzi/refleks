@@ -2,24 +2,32 @@ package models
 
 // Settings represents persisted application settings.
 type Settings struct {
-	SteamInstallDir      string                  `json:"steamInstallDir"`
-	KovaaksInstallDir    string                  `json:"kovaaksInstallDir"`
-	SteamIDOverride      string                  `json:"steamIdOverride,omitempty"`
-	PersonaNameOverride  string                  `json:"personaNameOverride,omitempty"`
-	LastSeenVersion      string                  `json:"lastSeenVersion,omitempty"`
-	SessionGapMinutes    int                     `json:"sessionGapMinutes"`
-	RecentRunsDays       int                     `json:"recentRunsDays"`
-	RecentRunsMinCount   int                     `json:"recentRunsMinCount"`
-	Theme                string                  `json:"theme"`
-	Font                 string                  `json:"font,omitempty"`
-	FavoriteBenchmarks   []string                `json:"favoriteBenchmarks,omitempty"`
-	MouseTrackingEnabled bool                    `json:"mouseTrackingEnabled"`
-	MouseBufferMinutes   int                     `json:"mouseBufferMinutes"`
-	AutostartEnabled     bool                    `json:"autostartEnabled"`
-	AnonymousEnabled     bool                    `json:"anonymousEnabled"`
-	RunSyncEnabled       bool                    `json:"runSyncEnabled"`
-	ScenarioNotes        map[string]ScenarioNote `json:"scenarioNotes,omitempty"`
-	SessionNotes         map[string]SessionNote  `json:"sessionNotes,omitempty"`
+	SteamInstallDir         string                  `json:"steamInstallDir"`
+	KovaaksInstallDir       string                  `json:"kovaaksInstallDir"`
+	SteamIDOverride         string                  `json:"steamIdOverride,omitempty"`
+	PersonaNameOverride     string                  `json:"personaNameOverride,omitempty"`
+	LastSeenVersion         string                  `json:"lastSeenVersion,omitempty"`
+	SessionGapMinutes       int                     `json:"sessionGapMinutes"`
+	RecentRunsDays          int                     `json:"recentRunsDays"`
+	RecentRunsMinCount      int                     `json:"recentRunsMinCount"`
+	Theme                   string                  `json:"theme"`
+	Font                    string                  `json:"font,omitempty"`
+	Scale                   string                  `json:"scale,omitempty"`
+	Language                string                  `json:"language"`
+	FavoriteBenchmarks      []string                `json:"favoriteBenchmarks,omitempty"`
+	MouseTrackingEnabled    bool                    `json:"mouseTrackingEnabled"`
+	MouseBufferMinutes      int                     `json:"mouseBufferMinutes"`
+	ScreenCaptureEnabled    bool                    `json:"screenCaptureEnabled"`
+	ScreenCaptureFPS        int                     `json:"screenCaptureFps"`
+	ScreenCaptureResolution string                  `json:"screenCaptureResolution,omitempty"`
+	ReplayCleanupEnabled    bool                    `json:"replayCleanupEnabled"`
+	ReplayRetentionDays     int                     `json:"replayRetentionDays"`
+	ReplayStorageLimitGB    int                     `json:"replayStorageLimitGb"`
+	AutostartEnabled        bool                    `json:"autostartEnabled"`
+	AnonymousEnabled        bool                    `json:"anonymousEnabled"`
+	RunSyncEnabled          bool                    `json:"runSyncEnabled"`
+	ScenarioNotes           map[string]ScenarioNote `json:"scenarioNotes,omitempty"`
+	SessionNotes            map[string]SessionNote  `json:"sessionNotes,omitempty"`
 }
 
 // ScenarioNote holds user notes and sensitivity for a scenario.

@@ -1,8 +1,8 @@
-# RefleK's - Open Source
+# RefleK's Desktop - Open Source
 
 ## The Repository
 
-This repository is home to the source code for RefleK's. It is developed in the open, and available under the GNU General Public License v3.0.
+This repository is home to the source code for RefleK's Desktop. It is developed in the open, and available under the GNU General Public License v3.0.
 
 ## RefleK's
 
@@ -15,6 +15,7 @@ Download the latest release for Windows at [refleksapp.com](https://refleksapp.c
 ## Contributing
 
 We welcome contributions. Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to:
+
 - Report bugs and request features
 - Build and run from source
 - Submit pull requests

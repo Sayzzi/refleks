@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"time"
-
-	"github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"refleks/internal/autostart"
 	"refleks/internal/benchmarks"
@@ -15,9 +18,12 @@ import (
 	"refleks/internal/models"
 	"refleks/internal/process"
 	"refleks/internal/runs"
+	"refleks/internal/runs/screen"
 	"refleks/internal/scenarios"
 	appsettings "refleks/internal/settings"
 	"refleks/internal/updater"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // App struct
@@ -33,17 +39,25 @@ type App struct {
 	autostartSvc   *autostart.Service
 	processWatcher *process.Watcher
 	watcherCancel  context.CancelFunc
-	isQuitting     bool
+	isQuitting     atomic.Bool
+	startedHidden  bool
 }
 
-// NewApp creates a new App application struct
-func NewApp() *App { return &App{} }
+// NewApp creates a new App application struct. startedHidden reports whether
+// the process was launched with --monitor (autostart/background mode).
+func NewApp(startedHidden bool) *App { return &App{startedHidden: startedHidden} }
 
 // startup is called when the app starts. The context is saved
 // so we can call the runtime methods
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	runtime.LogInfo(a.ctx, "RefleK's app starting up")
+	if err := screen.CleanupAbandonedSessions(); err != nil {
+		runtime.LogWarningf(a.ctx, "screen: clean abandoned capture sessions: %v", err)
+	}
+	if err := updater.CleanupAbandonedDownloads(); err != nil {
+		runtime.LogWarningf(a.ctx, "updater: clean abandoned downloads: %v", err)
+	}
 
 	// Initialize Settings Service
 	a.settingsSvc = appsettings.NewService()
@@ -72,15 +86,30 @@ func (a *App) startup(ctx context.Context) {
 	// Initialize Autostart Service
 	a.autostartSvc = autostart.NewService()
 
-	// Initialize Process Watcher if enabled
+	// Reconcile the autostart registry entry with the running executable and
+	// the saved setting. Re-pointing at os.Executable() keeps "Start with
+	// Kovaak's" working across the rename from "RefleK's.exe" to "refleks.exe"
+	// and across install-directory moves; removing an entry that is no longer
+	// wanted prevents a stale --monitor registration from launching a hidden
+	// instance.
+	if err := a.autostartSvc.Sync(settings.AutostartEnabled, "--monitor"); err != nil {
+		runtime.LogWarningf(a.ctx, "autostart sync failed: %v", err)
+	}
+
+	// A hidden launch is only legitimate when autostart is enabled. If a stale
+	// entry started us with --monitor but autostart is now off, show the window
+	// so the user isn't left with an invisible background process.
+	if a.startedHidden && !settings.AutostartEnabled {
+		runtime.WindowShow(a.ctx)
+	}
+
 	if settings.AutostartEnabled {
 		a.startProcessWatcher()
 	}
 
-	// Auto-start watcher
-	if err := a.runsRuntimeSvc.StartWatcher(""); err != nil {
-		runtime.LogWarningf(a.ctx, "Auto-start watcher failed: %v", err)
-	}
+	// Auto-start watcher. RuntimeService logs a start failure at its owner
+	// boundary before returning it, so avoid emitting the same error twice.
+	_ = a.runsRuntimeSvc.StartWatcher()
 
 	// Fire-and-forget benchmark definitions + progress cache warmup/sync
 	go func() {
@@ -92,6 +121,10 @@ func (a *App) startup(ctx context.Context) {
 			runtime.LogErrorf(a.ctx, "benchmark cache sync failed: %v", err)
 		}
 	}()
+
+	// Fire-and-forget replay cleanup. The runtime service also requests a
+	// coalesced pass whenever a new replay is published or its settings change.
+	a.runsRuntimeSvc.RequestReplayCleanup()
 
 	// Fire-and-forget check for app updates
 	go func() {
@@ -109,8 +142,10 @@ func (a *App) startup(ctx context.Context) {
 }
 
 // StartWatcher begins monitoring the configured Kovaak's install directory.
+// The optional installDir overrides the currently configured directory; pass
+// an empty string to keep the existing setting.
 func (a *App) StartWatcher(installDir string) error {
-	return a.runsRuntimeSvc.StartWatcher(installDir)
+	return a.runsRuntimeSvc.StartWatcherAt(installDir)
 }
 
 // StopWatcher stops the watcher if running.
@@ -123,10 +158,16 @@ func (a *App) GetRecentRuns(limit int) []models.RunRecord {
 	return a.runsRuntimeSvc.GetRecent(limit)
 }
 
-// GetRunEvents returns the kill event rows for a single run file.
-// Events are loaded on demand (not stored in the index) to keep memory usage low.
-func (a *App) GetRunEvents(filePath string) ([][]string, error) {
-	return a.runStore.LoadRunEvents(filePath)
+// GetRunStatsEvents returns the CSV-derived event rows nested under stats.events.
+// They are loaded on demand instead of being included in the bulk recent-runs payload.
+func (a *App) GetRunStatsEvents(filePath string) ([]models.RunStatsEvent, error) {
+	return a.runStore.LoadRunStatsEvents(filePath)
+}
+
+// GetRunPerformanceEvents returns the event list stored in the v2 performances payload.
+// They are loaded on demand instead of being included in the bulk recent-runs payload.
+func (a *App) GetRunPerformanceEvents(filePath string) ([]models.RunPerformanceEvent, error) {
+	return a.runStore.LoadRunPerformanceEvents(filePath)
 }
 
 // GetRunTrace retrieves the binary trace data for a run, encoded as Base64.
@@ -135,9 +176,146 @@ func (a *App) GetRunTrace(filePath string) (string, error) {
 	return a.runStore.LoadRunTrace(filePath)
 }
 
+// resolveReplayPath finds the on-disk replay file for a run, trying both
+// container extensions a recording may have been saved with. Returns the
+// absolute disk path and the URL path served by the embedded
+// replayAssetHandler at /replays/..., or ok=false if no recording exists.
+func (a *App) resolveReplayPath(filePath string) (diskPath, urlPath string, ok bool) {
+	base := strings.TrimSuffix(filepath.Base(filePath), constants.RunFileExt)
+	for _, ext := range []string{".mp4", ".webm"} {
+		path, err := a.runStore.ReplayPath(filePath, ext)
+		if err != nil {
+			continue
+		}
+		if info, err := os.Stat(path); err == nil {
+			// A content version lets the browser cache ranges for smooth seeking
+			// without serving a stale file after an export replaces this replay.
+			version := fmt.Sprintf("%x-%x", info.ModTime().UnixNano(), info.Size())
+			return path, "/replays/" + url.PathEscape(base+ext) + "?v=" + version, true
+		}
+	}
+	return "", "", false
+}
+
+// GetRunReplay returns the URL path to the screen recording replay for a run,
+// or an empty string if no recording exists. The URL is served by the
+// embedded replayAssetHandler at /replays/...
+func (a *App) GetRunReplay(filePath string) string {
+	_, urlPath, ok := a.resolveReplayPath(filePath)
+	if !ok {
+		return ""
+	}
+	return urlPath
+}
+
+// GetRunReplayStatus reports whether a replay is still being processed, is
+// ready, or failed/unavailable, without making the frontend infer state from a
+// missing file.
+func (a *App) GetRunReplayStatus(filePath string) models.ReplayStatus {
+	if a.runStore == nil {
+		return models.ReplayStatus{State: models.ReplayStateUnavailable, Message: constants.ReplayStorageUnavailable}
+	}
+	return a.runStore.GetReplayStatus(filePath)
+}
+
+// GetRunReplayInfo returns technical metadata (resolution, frame rate, codec,
+// duration, file size) about a run's saved replay, probed directly from the
+// file, or nil if no recording exists.
+func (a *App) GetRunReplayInfo(filePath string) (*screen.ReplayFileInfo, error) {
+	diskPath, _, ok := a.resolveReplayPath(filePath)
+	if !ok {
+		return nil, nil
+	}
+	enc := a.runsRuntimeSvc.Encoder()
+	if enc == nil {
+		return nil, fmt.Errorf("encoder not available")
+	}
+	info, err := enc.ProbeReplay(diskPath)
+	if err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+// DeleteRunReplay deletes a run's saved screen recording replay, if any.
+// No-op (not an error) if no recording exists.
+func (a *App) DeleteRunReplay(filePath string) error {
+	if a.runStore == nil {
+		return nil
+	}
+	return a.runStore.DeleteReplay(filePath)
+}
+
+// ExportRunReplay copies a run's saved screen recording replay to a location
+// chosen by the user via a native save dialog. Returns the destination path,
+// or an empty string if the dialog was cancelled.
+func (a *App) ExportRunReplay(filePath string) (string, error) {
+	diskPath, _, ok := a.resolveReplayPath(filePath)
+	if !ok {
+		return "", constants.NewCoded(constants.ReplayMissing)
+	}
+
+	savePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:           "Export replay",
+		DefaultFilename: filepath.Base(diskPath),
+		Filters: []runtime.FileFilter{
+			{DisplayName: "Video files", Pattern: "*" + filepath.Ext(diskPath)},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	if savePath == "" {
+		return "", nil // dialog cancelled
+	}
+
+	if err := copyFile(diskPath, savePath); err != nil {
+		return "", constants.WrapCoded(constants.ReplayExportFailed, err)
+	}
+	return savePath, nil
+}
+
+// copyFile streams src to dst, removing a partial destination on failure.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	return nil
+}
+
+// GetScreenCaptureInfo returns encoder availability and the health of the
+// current capture session. Encoder probing alone is not treated as capture
+// success because the D3D/FFmpeg session starts later.
+func (a *App) GetScreenCaptureInfo() screen.CaptureStatus {
+	if a.runsRuntimeSvc == nil {
+		return screen.CaptureStatus{State: "unavailable", Message: constants.ScreenCaptureUninitialized}
+	}
+	return a.runsRuntimeSvc.ScreenCaptureStatus()
+}
+
 // GetLastScenarioScores fetches the last 10 scores for a given scenario from KovaaK's API.
 func (a *App) GetLastScenarioScores(scenarioName string) ([]models.KovaaksLastScore, error) {
-	return a.scenarioSvc.GetLastScores(scenarioName)
+	scores, err := a.scenarioSvc.GetLastScores(scenarioName)
+	if err != nil {
+		return nil, constants.WrapCoded(constants.ScenarioScoresFetch, err)
+	}
+	return scores, nil
 }
 
 // GetBenchmarks returns the cached benchmark list for the Explore UI.
@@ -150,18 +328,12 @@ func (a *App) GetBenchmarkProgress(benchmarkId int) (models.BenchmarkProgress, e
 	// 1. Try to get from cache (or fetch if missing)
 	data, cached, err := a.benchmarkSvc.GetBenchmarkProgress(benchmarkId, true)
 	if err != nil {
-		return models.BenchmarkProgress{}, err
+		return models.BenchmarkProgress{}, constants.WrapCoded(constants.BenchmarkProgressFetch, err)
 	}
 
-	// 2. Trigger background refresh (if it was cached)
+	// 2. Queue a deduplicated background refresh when cached data was returned.
 	if cached {
-		go func() {
-			fresh, _, err := a.benchmarkSvc.GetBenchmarkProgress(benchmarkId, false)
-			if err == nil {
-				// Emit event with fresh data so frontend can update
-				runtime.EventsEmit(a.ctx, fmt.Sprintf("%s%d", constants.EventBenchmarkProgressPrefix, benchmarkId), fresh)
-			}
-		}()
+		a.benchmarkSvc.QueueBenchmarkProgressRefresh(benchmarkId)
 	}
 
 	return data, nil
@@ -169,12 +341,20 @@ func (a *App) GetBenchmarkProgress(benchmarkId int) (models.BenchmarkProgress, e
 
 // GetAllBenchmarkProgresses returns progress for all benchmarks, using cache if available.
 func (a *App) GetAllBenchmarkProgresses() (map[int]models.BenchmarkProgress, error) {
-	return a.benchmarkSvc.GetAllBenchmarkProgresses()
+	progress, err := a.benchmarkSvc.GetAllBenchmarkProgresses()
+	if err != nil {
+		return nil, constants.WrapCoded(constants.BenchmarkProgressFetch, err)
+	}
+	return progress, nil
 }
 
 // RefreshAllBenchmarkProgresses fetches fresh data for all benchmarks and updates the cache.
 func (a *App) RefreshAllBenchmarkProgresses() (map[int]models.BenchmarkProgress, error) {
-	return a.benchmarkSvc.RefreshAllBenchmarkProgresses()
+	progress, err := a.benchmarkSvc.RefreshAllBenchmarkProgresses()
+	if err != nil {
+		return nil, constants.WrapCoded(constants.BenchmarkProgressFetch, err)
+	}
+	return progress, nil
 }
 
 // --- Settings IPC ---
@@ -206,24 +386,30 @@ func (a *App) ResetSettings(resetConfig, resetFavorites, resetScenarioNotes, res
 		defaults := appsettings.Default()
 		newSettings.SteamInstallDir = defaults.SteamInstallDir
 		newSettings.KovaaksInstallDir = defaults.KovaaksInstallDir
+		newSettings.SteamIDOverride = defaults.SteamIDOverride
+		newSettings.PersonaNameOverride = defaults.PersonaNameOverride
 		newSettings.SessionGapMinutes = defaults.SessionGapMinutes
 		newSettings.RecentRunsDays = defaults.RecentRunsDays
 		newSettings.RecentRunsMinCount = defaults.RecentRunsMinCount
 		newSettings.Theme = defaults.Theme
 		newSettings.Font = defaults.Font
+		newSettings.Scale = defaults.Scale
+		newSettings.Language = defaults.Language
 		newSettings.MouseTrackingEnabled = defaults.MouseTrackingEnabled
 		newSettings.MouseBufferMinutes = defaults.MouseBufferMinutes
+		newSettings.ScreenCaptureEnabled = defaults.ScreenCaptureEnabled
+		newSettings.ScreenCaptureFPS = defaults.ScreenCaptureFPS
+		newSettings.ScreenCaptureResolution = defaults.ScreenCaptureResolution
 		newSettings.AutostartEnabled = defaults.AutostartEnabled
 		newSettings.AnonymousEnabled = defaults.AnonymousEnabled
 		newSettings.RunSyncEnabled = defaults.RunSyncEnabled
 		newSettings.LastSeenVersion = defaults.LastSeenVersion
 
 		// Sync autostart state
+		_ = a.autostartSvc.Sync(newSettings.AutostartEnabled, "--monitor")
 		if newSettings.AutostartEnabled {
-			_ = a.autostartSvc.Enable("--monitor")
 			a.startProcessWatcher()
 		} else {
-			_ = a.autostartSvc.Disable()
 			a.stopProcessWatcher()
 		}
 	}
@@ -255,29 +441,88 @@ func (a *App) GetDefaultSettings() models.Settings {
 	return appsettings.Sanitize(appsettings.Default())
 }
 
+// --- Custom theme ---
+
+// GetCustomThemeCSS returns the user's custom theme stylesheet, or an empty
+// string when no custom theme file exists yet.
+func (a *App) GetCustomThemeCSS() string {
+	path, err := appsettings.ConfigFilePath(constants.CustomThemeFileName)
+	if err != nil {
+		return ""
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(content)
+}
+
+// WriteCustomThemeCSS writes the custom theme stylesheet into the config
+// directory, creating it first if needed. The content is generated by the
+// frontend so the template always mirrors the shipped stylesheet.
+func (a *App) WriteCustomThemeCSS(content string) error {
+	dir, err := appsettings.EnsureConfigDir()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, constants.CustomThemeFileName), []byte(content), 0o644)
+}
+
+// OpenCustomThemeCSS opens the custom theme file with the system's default
+// handler (e.g. a text editor), so users can edit it in place.
+func (a *App) OpenCustomThemeCSS() error {
+	path, err := appsettings.ConfigFilePath(constants.CustomThemeFileName)
+	if err != nil {
+		return err
+	}
+	return process.OpenURL(path)
+}
+
+// escapeDeepLinkValue percent-encodes a value so it can be embedded in a
+// steam:// deep-link query. It encodes everything except RFC 3986 unreserved
+// characters (A-Za-z0-9-._~), so characters like '&', ';', '=', '?' and ':'
+// cannot be misinterpreted as separators by Steam's URL parser.
+// url.QueryEscape is close, but it encodes spaces as '+' (form encoding),
+// which some deep-link parsers pass through literally; '%20' is unambiguous.
+func escapeDeepLinkValue(s string) string {
+	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
+}
+
 // LaunchKovaaksScenario opens the Steam deep-link to launch a given scenario in Kovaak's.
 func (a *App) LaunchKovaaksScenario(name string, mode string) error {
-	n := url.PathEscape(name)
-	if n == "" {
+	name = strings.TrimSpace(name)
+	if name == "" {
 		return fmt.Errorf("missing scenario name")
 	}
 	if mode == "" {
 		mode = "challenge"
 	}
-	m := url.PathEscape(mode)
-	deeplink := fmt.Sprintf("steam://run/%d/?action=jump-to-scenario;name=%s;mode=%s", constants.KovaaksSteamAppID, n, m)
-	runtime.BrowserOpenURL(a.ctx, deeplink)
+	deeplink := fmt.Sprintf(
+		"steam://run/%d/?action=jump-to-scenario;name=%s;mode=%s",
+		constants.KovaaksSteamAppID,
+		escapeDeepLinkValue(name),
+		escapeDeepLinkValue(mode),
+	)
+	if err := process.OpenURL(deeplink); err != nil {
+		return fmt.Errorf("failed to open scenario deep link: %w", err)
+	}
 	return nil
 }
 
 // LaunchKovaaksPlaylist opens a Steam deep-link that jumps directly to a shared playlist by sharecode.
 func (a *App) LaunchKovaaksPlaylist(sharecode string) error {
-	sc := url.PathEscape(sharecode)
-	if sc == "" {
+	sharecode = strings.TrimSpace(sharecode)
+	if sharecode == "" {
 		return fmt.Errorf("missing sharecode")
 	}
-	deeplink := fmt.Sprintf("steam://run/%d/?action=jump-to-playlist;sharecode=%s", constants.KovaaksSteamAppID, sc)
-	runtime.BrowserOpenURL(a.ctx, deeplink)
+	deeplink := fmt.Sprintf(
+		"steam://run/%d/?action=jump-to-playlist;sharecode=%s",
+		constants.KovaaksSteamAppID,
+		escapeDeepLinkValue(sharecode),
+	)
+	if err := process.OpenURL(deeplink); err != nil {
+		return fmt.Errorf("failed to open playlist deep link: %w", err)
+	}
 	return nil
 }
 
@@ -293,7 +538,10 @@ func (a *App) DownloadAndInstallUpdate(version string) error {
 	if err := a.updaterSvc.DownloadAndInstallUpdate(a.ctx, version); err != nil {
 		return err
 	}
-	// Gracefully quit current app so installer can proceed
+	// Gracefully quit current app so installer can proceed. Mark this as an
+	// intentional exit so the close handler does not convert it into a hidden
+	// background instance when autostart is enabled.
+	a.isQuitting.Store(true)
 	go func() {
 		time.Sleep(1 * time.Second)
 		runtime.Quit(a.ctx)
@@ -323,21 +571,22 @@ func (a *App) ClearCache() error {
 // --- Autostart & Monitoring ---
 
 func (a *App) SetAutostart(enabled bool) error {
+	// Apply the OS entry first so a failure leaves the saved setting untouched;
+	// roll the entry back if persisting the setting fails, keeping the two in
+	// sync either way.
+	if err := a.autostartSvc.Sync(enabled, "--monitor"); err != nil {
+		return constants.WrapCoded(constants.AutostartUpdateFailed, err)
+	}
 	settings := a.settingsSvc.Get()
 	settings.AutostartEnabled = enabled
 	if err := a.settingsSvc.Update(settings); err != nil {
+		_ = a.autostartSvc.Sync(!enabled, "--monitor")
 		return err
 	}
 
 	if enabled {
-		if err := a.autostartSvc.Enable("--monitor"); err != nil {
-			return fmt.Errorf("failed to enable autostart: %w", err)
-		}
 		a.startProcessWatcher()
 	} else {
-		if err := a.autostartSvc.Disable(); err != nil {
-			return fmt.Errorf("failed to disable autostart: %w", err)
-		}
 		a.stopProcessWatcher()
 	}
 	return nil
@@ -351,15 +600,7 @@ func (a *App) startProcessWatcher() {
 	a.watcherCancel = cancel
 
 	a.processWatcher = process.NewWatcher(constants.KovaaksProcessName, func() {
-		runtime.WindowShow(a.ctx)
-		if runtime.Environment(a.ctx).Platform == "windows" {
-			// Briefly set always on top to grab focus, then disable
-			runtime.WindowSetAlwaysOnTop(a.ctx, true)
-			go func() {
-				time.Sleep(500 * time.Millisecond)
-				runtime.WindowSetAlwaysOnTop(a.ctx, false)
-			}()
-		}
+		a.ShowWindow()
 	}, nil)
 	go a.processWatcher.Start(ctx)
 }
@@ -374,22 +615,43 @@ func (a *App) stopProcessWatcher() {
 
 // QuitApp sets the quitting flag and exits.
 func (a *App) QuitApp() {
-	a.isQuitting = true
+	a.isQuitting.Store(true)
 	runtime.Quit(a.ctx)
 }
 
-// ShowWindow brings the window to front.
+// ShowWindow makes the app visible without forcing it to the foreground.
+// This is intentional: when KovaaK's starts, RefleK's should not interrupt
+// the game or steal focus from it.
 func (a *App) ShowWindow() {
 	runtime.WindowShow(a.ctx)
 }
 
 func (a *App) shouldRunInBackground() bool {
-	if a.isQuitting {
+	if a.isQuitting.Load() {
 		return false
 	}
 	return a.settingsSvc.Get().AutostartEnabled
 }
 
+func (a *App) beforeClose() bool {
+	if a.shouldRunInBackground() {
+		runtime.LogInfo(a.ctx, "window close requested; hiding app and keeping background monitoring active")
+		a.hideWindow()
+		return true
+	}
+	runtime.LogInfo(a.ctx, "window close requested; exiting app")
+	return false
+}
+
 func (a *App) hideWindow() {
 	runtime.WindowHide(a.ctx)
+}
+
+// shutdown runs once on a real process exit (see OnShutdown in main.go).
+// It stops capture and performs best-effort cleanup of temporary segments;
+// startup cleanup removes any files that were locked or left by a forced exit.
+func (a *App) shutdown(ctx context.Context) {
+	if a.runsRuntimeSvc != nil {
+		a.runsRuntimeSvc.Shutdown()
+	}
 }

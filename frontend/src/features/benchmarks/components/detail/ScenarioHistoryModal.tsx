@@ -1,92 +1,160 @@
-import { Loading, Modal } from '@/shared/components'
-import type { ChartConfig } from '@/shared/components/ui/chart'
-import { ChartContainer, ChartTooltip, ChartTooltipContent } from '@/shared/components/ui/chart'
-import { CHART_SERIES_COLORS, CHART_STYLE, buildThresholdAnchoredScoreDomain, getLastScenarioScores } from '@/shared/lib'
-import type { KovaaksLastScore, RankDef } from '@/shared/types'
-import { useEffect, useMemo, useState } from 'react'
-import { CartesianGrid, Line, LineChart, ReferenceArea, XAxis, YAxis } from 'recharts'
-import { formatNumber } from '../../lib/detailFormatting'
+import { Loading, Modal } from "@/shared/components";
+import type { ChartConfig } from "@/shared/components/ui/chart";
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+} from "@/shared/components/ui/chart";
+import {
+  CHART_SERIES_COLORS,
+  CHART_STYLE,
+  buildThresholdAnchoredScoreDomain,
+  getLastScenarioScores,
+  translateMessage,
+} from "@/shared/lib";
+import { getLocale, useI18n } from "@/shared/lib/i18n";
+import { useChartAnimation } from "@/shared/hooks";
+import type { KovaaksLastScore, RankDef } from "@/shared/types";
+import { useEffect, useMemo, useState } from "react";
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ReferenceArea,
+  XAxis,
+  YAxis,
+} from "recharts";
+import { formatNumber } from "../../lib/detailFormatting";
 
 type Props = {
-  isOpen: boolean
-  onClose: () => void
-  scenarioName: string
-  thresholds: number[]
-  rankDefs: RankDef[]
-}
+  isOpen: boolean;
+  onClose: () => void;
+  scenarioName: string;
+  thresholds: number[];
+  rankDefs: RankDef[];
+};
 
 type TrendPoint = {
-  run: number
-  score: number
-  dateLabel: string
-}
+  run: number;
+  score: number;
+  dateLabel: string;
+};
 
 type RankBand = {
-  y1: number
-  y2: number
-  color: string
+  y1: number;
+  y2: number;
+  color: string;
+};
+
+let dateFormatterLocale: string | null = null;
+let dateFormatter: Intl.DateTimeFormat | null = null;
+function getDateFormatter(): Intl.DateTimeFormat {
+  const locale = getLocale();
+  if (!dateFormatter || dateFormatterLocale !== locale) {
+    dateFormatterLocale = locale;
+    dateFormatter = new Intl.DateTimeFormat(locale, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+  return dateFormatter;
 }
 
-const chartConfig: ChartConfig = {
-  score: { label: 'Score', color: CHART_SERIES_COLORS.scoreHistory },
-}
-
-export function ScenarioHistoryModal({ isOpen, onClose, scenarioName, thresholds, rankDefs }: Props) {
-  const [scores, setScores] = useState<KovaaksLastScore[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+export function ScenarioHistoryModal({
+  isOpen,
+  onClose,
+  scenarioName,
+  thresholds,
+  rankDefs,
+}: Props) {
+  const { t, locale } = useI18n();
+  const [scores, setScores] = useState<KovaaksLastScore[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!isOpen || !scenarioName) return
+    if (!isOpen || !scenarioName) return;
 
-    setLoading(true)
-    setError(null)
-    setScores([])
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setScores([]);
 
     getLastScenarioScores(scenarioName)
-      .then(result => setScores(result))
-      .catch(fetchError => {
-        setError(fetchError instanceof Error ? fetchError.message : String(fetchError))
+      .then((result) => {
+        if (!cancelled) setScores(result);
       })
-      .finally(() => setLoading(false))
-  }, [isOpen, scenarioName])
+      .catch((fetchError) => {
+        if (!cancelled) setError(translateMessage(fetchError));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
 
-  const sorted = useMemo(() => [...scores].reverse(), [scores])
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, scenarioName]);
+
+  const sorted = useMemo(() => [...scores].reverse(), [scores]);
+
+  const chartConfig: ChartConfig = {
+    score: {
+      label: t("benchmarks.scenarioHistory.score"),
+      color: CHART_SERIES_COLORS.scoreHistory,
+    },
+  };
 
   const trendData = useMemo<TrendPoint[]>(() => {
     return sorted.map((entry, index) => {
-      const rawDate = entry.attributes?.challengeStart
-      const date = rawDate ? new Date(rawDate) : null
-      const dateLabel = date && !Number.isNaN(date.getTime())
-        ? date.toLocaleString()
-        : (rawDate || 'Unknown')
+      const rawDate = entry.attributes?.challengeStart;
+      const date = rawDate ? new Date(rawDate) : null;
+      const dateLabel =
+        date && !Number.isNaN(date.getTime())
+          ? getDateFormatter().format(date)
+          : rawDate || t("common.unknown");
 
       return {
         run: index + 1,
         score: Number(entry.attributes?.score || 0),
         dateLabel,
-      }
-    })
-  }, [sorted])
+      };
+    });
+    // `t` is referentially stable — the locale drives recomputation.
+  }, [sorted, locale]);
 
   const numericScores = useMemo(
-    () => trendData.map(point => point.score).filter(score => Number.isFinite(score) && score > 0),
+    () =>
+      trendData
+        .map((point) => point.score)
+        .filter((score) => Number.isFinite(score) && score > 0),
     [trendData],
-  )
+  );
 
   const scoreDomain = useMemo(
     () => buildThresholdAnchoredScoreDomain(numericScores, thresholds),
     [numericScores, thresholds],
-  )
+  );
 
   const rankBands = useMemo(() => {
-    return buildRankBands(thresholds, rankDefs, scoreDomain)
-  }, [rankDefs, scoreDomain, thresholds])
+    return buildRankBands(thresholds, rankDefs, scoreDomain);
+  }, [rankDefs, scoreDomain, thresholds]);
 
   return (
-    <Modal isOpen={isOpen} onClose={onClose} title={`Scenario History · ${scenarioName}`}>
-      <div className="space-y-3 px-4 pb-4">
-        {loading && <Loading />}
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title={t("benchmarks.scenarioHistory.title", { scenario: scenarioName })}
+      className="grid-rows-[auto_minmax(0,1fr)]"
+    >
+      <div className="flex min-h-0 flex-1 flex-col space-y-3 px-4 pb-4">
+        {loading && (
+          <div className="flex min-h-0 flex-1 items-center justify-center">
+            <Loading />
+          </div>
+        )}
 
         {!loading && error && (
           <div className="rounded-xl border border-destructive-border bg-destructive-soft p-4 text-sm text-destructive">
@@ -95,85 +163,132 @@ export function ScenarioHistoryModal({ isOpen, onClose, scenarioName, thresholds
         )}
 
         {!loading && !error && trendData.length === 0 && (
-          <div className="rounded-xl border border-border bg-surface p-4 text-sm text-surface-muted-foreground">No scores found.</div>
+          <div className="rounded-xl border border-border bg-surface p-4 text-sm text-surface-muted-foreground">
+            {t("benchmarks.scenarioHistory.noScores")}
+          </div>
         )}
 
         {!loading && !error && trendData.length > 0 && (
-          <>
-            <ChartContainer config={chartConfig} className="aspect-auto h-full w-full">
-              <LineChart data={trendData} margin={{ top: 2, right: 6, left: 0, bottom: 0 }}>
-                <CartesianGrid vertical={false} strokeDasharray="3 3" />
-                <XAxis dataKey="run" hide />
-                <YAxis
-                  tickLine={false}
-                  axisLine={false}
-                  tickMargin={6}
-                  width={46}
-                  domain={scoreDomain}
-                  tickFormatter={value => formatNumber(value, 0)}
-                />
-
-                {rankBands.map((band, index) => (
-                  <ReferenceArea
-                    key={`rank-band-${index}`}
-                    y1={band.y1}
-                    y2={band.y2}
-                    fill={band.color}
-                    fillOpacity={0.16}
-                    strokeOpacity={0}
-                    ifOverflow="extendDomain"
-                  />
-                ))}
-
-                <ChartTooltip
-                  content={
-                    <ChartTooltipContent
-                      labelFormatter={(_, payload) => payload?.[0]?.payload?.dateLabel ?? null}
-                    />
-                  }
-                />
-                <Line
-                  isAnimationActive={false}
-                  type="monotone"
-                  dataKey="score"
-                  stroke="var(--color-score)"
-                  strokeWidth={CHART_STYLE.linePrimaryWidth}
-                  dot={{ r: CHART_STYLE.pointRadius, fill: 'var(--color-score)', strokeWidth: 0 }}
-                  activeDot={{ r: CHART_STYLE.activePointRadius }}
-                />
-              </LineChart>
-            </ChartContainer>
-          </>
+          <ScenarioHistoryChart
+            trendData={trendData}
+            scoreDomain={scoreDomain}
+            rankBands={rankBands}
+            chartConfig={chartConfig}
+          />
         )}
       </div>
     </Modal>
-  )
+  );
 }
 
-function buildRankBands(thresholds: number[], rankDefs: RankDef[], domain: [number, number]): RankBand[] {
-  const [domainMin, domainMax] = domain
+/**
+ * The chart owns its animation hooks so they mount together with the dialog
+ * content. Radix unmounts the dialog on close, but a hook held by the
+ * always-mounted modal would stay revealed and skip the entrance animation on
+ * every reopen after the first.
+ */
+function ScenarioHistoryChart({
+  trendData,
+  scoreDomain,
+  rankBands,
+  chartConfig,
+}: {
+  trendData: TrendPoint[];
+  scoreDomain: [number, number];
+  rankBands: RankBand[];
+  chartConfig: ChartConfig;
+}) {
+  const { ref: chartRef, animationProps, revealed } = useChartAnimation();
+  return (
+    <ChartContainer
+      ref={chartRef}
+      config={chartConfig}
+      className="min-h-0 flex-1 aspect-auto w-full"
+    >
+      <LineChart
+        key={revealed ? "revealed" : "hidden"}
+        data={trendData}
+        margin={{ top: 2, right: 6, left: 0, bottom: 0 }}
+      >
+        <CartesianGrid vertical={false} strokeDasharray="3 3" />
+        <XAxis dataKey="run" hide />
+        <YAxis
+          tickLine={false}
+          axisLine={false}
+          tickMargin={6}
+          width={46}
+          domain={scoreDomain}
+          tickFormatter={(value) => formatNumber(value, 0)}
+        />
+
+        {rankBands.map((band, index) => (
+          <ReferenceArea
+            key={`rank-band-${index}`}
+            y1={band.y1}
+            y2={band.y2}
+            fill={band.color}
+            fillOpacity={0.16}
+            strokeOpacity={0}
+            ifOverflow="extendDomain"
+          />
+        ))}
+
+        <ChartTooltip
+          content={
+            <ChartTooltipContent
+              labelFormatter={(_, payload) =>
+                payload?.[0]?.payload?.dateLabel ?? null
+              }
+            />
+          }
+        />
+        <Line
+          {...animationProps}
+          type="monotone"
+          dataKey="score"
+          stroke="var(--color-score)"
+          strokeWidth={CHART_STYLE.linePrimaryWidth}
+          dot={{
+            r: CHART_STYLE.pointRadius,
+            fill: "var(--color-score)",
+            strokeWidth: 0,
+          }}
+          activeDot={{ r: CHART_STYLE.activePointRadius }}
+        />
+      </LineChart>
+    </ChartContainer>
+  );
+}
+
+function buildRankBands(
+  thresholds: number[],
+  rankDefs: RankDef[],
+  domain: [number, number],
+): RankBand[] {
+  const [domainMin, domainMax] = domain;
   const stops = thresholds
-    .filter(value => Number.isFinite(value) && value >= 0)
-    .sort((a, b) => a - b)
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .sort((a, b) => a - b);
 
-  if (stops.length < 2 || rankDefs.length === 0 || domainMax <= domainMin) return []
+  if (stops.length < 2 || rankDefs.length === 0 || domainMax <= domainMin)
+    return [];
 
-  const bands: RankBand[] = []
-  const maxIndex = Math.min(rankDefs.length, stops.length - 1)
+  const bands: RankBand[] = [];
+  const maxIndex = Math.min(rankDefs.length, stops.length - 1);
 
   for (let index = 0; index < maxIndex; index += 1) {
-    const rawStart = stops[index]
-    const rawEnd = index === maxIndex - 1 ? domainMax : stops[index + 1]
-    const y1 = Math.max(domainMin, rawStart)
-    const y2 = Math.min(domainMax, rawEnd)
-    if (y2 <= y1) continue
+    const rawStart = stops[index];
+    const rawEnd = index === maxIndex - 1 ? domainMax : stops[index + 1];
+    const y1 = Math.max(domainMin, rawStart);
+    const y2 = Math.min(domainMax, rawEnd);
+    if (y2 <= y1) continue;
 
     bands.push({
       y1,
       y2,
       color: rankDefs[index - 1]?.color,
-    })
+    });
   }
 
-  return bands
+  return bands;
 }

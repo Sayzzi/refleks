@@ -1,13 +1,14 @@
-import { Button, Label, Modal } from '@/shared/components'
-import { useEffect, useRef, useState } from 'react'
+import { Button, Label, Modal } from "@/shared/components";
+import { useI18n } from "@/shared/lib";
+import { useEffect, useRef, useState } from "react";
 
 type Props = {
-  isOpen: boolean
-  sessionLabel: string
-  initialNotes: string
-  onClose: () => void
-  onSave: (notes: string) => Promise<void>
-}
+  isOpen: boolean;
+  sessionLabel: string;
+  initialNotes: string;
+  onClose: () => void;
+  onSave: (notes: string) => Promise<void>;
+};
 
 export function HistorySessionDetailsModal({
   isOpen,
@@ -16,74 +17,83 @@ export function HistorySessionDetailsModal({
   onClose,
   onSave,
 }: Props) {
-  const [notes, setNotes] = useState(initialNotes)
-  const [saving, setSaving] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const notesRef = useRef<HTMLTextAreaElement>(null)
+  const { t } = useI18n();
+  const [notes, setNotes] = useState(initialNotes);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const notesRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    if (!isOpen) return
-    setNotes(initialNotes)
-    setError(null)
-  }, [isOpen, initialNotes])
+    if (!isOpen) return;
+    setNotes(initialNotes);
+    setError(null);
+  }, [isOpen, initialNotes]);
 
   useEffect(() => {
-    if (!isOpen) return
+    if (!isOpen) return;
     requestAnimationFrame(() => {
-      notesRef.current?.focus()
-    })
-  }, [isOpen])
+      notesRef.current?.focus();
+    });
+  }, [isOpen]);
 
-  const hasChanges = notes !== initialNotes
+  const hasChanges = notes !== initialNotes;
 
   const handleSave = async () => {
     if (!hasChanges) {
-      onClose()
-      return
+      onClose();
+      return;
     }
 
-    setSaving(true)
-    setError(null)
+    setSaving(true);
+    setError(null);
     try {
-      await onSave(notes)
-      onClose()
+      await onSave(notes);
+      onClose();
     } catch {
-      setError('Failed to save session notes. Please try again.')
+      setError(t("history.sessionDetails.saveError"));
     } finally {
-      setSaving(false)
+      setSaving(false);
     }
-  }
+  };
 
   return (
-    <Modal isOpen={isOpen} onClose={onClose} title="Session Notes" width={620} height="auto">
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title={t("history.sessionDetails.title")}
+      width="38.75rem"
+      height="auto"
+    >
       <div className="space-y-5 px-6 pb-6">
-        <div className="text-xs text-surface-muted-foreground">{sessionLabel}</div>
+        <div className="text-xs text-surface-muted-foreground">
+          {sessionLabel}
+        </div>
 
         <div className="space-y-2">
           <Label htmlFor="session-notes">
-            Notes
+            {t("history.sessionDetails.notesLabel")}
           </Label>
           <textarea
             ref={notesRef}
             id="session-notes"
             value={notes}
-            onChange={event => setNotes(event.target.value)}
-            placeholder="Add notes for this session..."
-            className="min-h-[180px] w-full resize-none rounded-xl border border-input bg-surface px-3 py-2.5 text-sm text-foreground placeholder:text-surface-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            onChange={(event) => setNotes(event.target.value)}
+            placeholder={t("history.sessionDetails.notesPlaceholder")}
+            className="min-h-[11.25rem] w-full resize-none rounded-xl border border-input bg-surface px-3 py-2.5 text-sm text-foreground placeholder:text-surface-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           />
         </div>
 
-        {error && (
-          <p className="text-xs text-destructive">{error}</p>
-        )}
+        {error && <p className="text-xs text-destructive">{error}</p>}
 
         <div className="flex justify-end gap-2 pt-1">
-          <Button variant="ghost" onClick={onClose} disabled={saving}>Cancel</Button>
+          <Button variant="ghost" onClick={onClose} disabled={saving}>
+            {t("common.actions.cancel")}
+          </Button>
           <Button onClick={handleSave} disabled={saving || !hasChanges}>
-            {saving ? 'Saving...' : 'Save'}
+            {saving ? t("common.actions.saving") : t("common.actions.save")}
           </Button>
         </div>
       </div>
     </Modal>
-  )
+  );
 }
